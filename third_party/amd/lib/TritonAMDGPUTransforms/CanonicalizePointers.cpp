@@ -495,8 +495,8 @@ public:
   }
 };
 
-class ConvertSymmAt : public PointerCanonicalizationPattern<
-                                triton::distributed::SymmAtOp> {
+class ConvertSymmAt
+    : public PointerCanonicalizationPattern<triton::distributed::SymmAtOp> {
 public:
   using PointerCanonicalizationPattern::PointerCanonicalizationPattern;
 
@@ -520,8 +520,7 @@ public:
     triton::distributed::SymmAtOp newSymmAtOp =
         rewriter.create<triton::distributed::SymmAtOp>(
             newSymmAtOp->getLoc(), fatPtrBase, adaptor.getRank()[0]);
-    rewriter.replaceOpWithMultiple(symmAtOp,
-                                   {{newSymmAtOp, fatPtrOffset}});
+    rewriter.replaceOpWithMultiple(symmAtOp, {{newSymmAtOp, fatPtrOffset}});
     fatPtrs[{newSymmAtOp, fatPtrOffset}] =
         fatPtrs.at({fatPtrBase, fatPtrOffset});
 
@@ -1669,7 +1668,7 @@ void TritonAMDGPUCanonicalizePointersPass::runOnOperation() {
       MaterializeFatPointerVariadic<tt::CallOp>,
       MaterializeFatPointerVariadic<tt::ExternElementwiseOp>,
       MaterializeFatPointerVariadic<tt::ElementwiseInlineAsmOp>,
-      MaterializeFatPointerVariadic<tt::PrintOp>, 
+      MaterializeFatPointerVariadic<tt::PrintOp>,
       MaterializeFatPointerVariadic<triton::distributed::ExternCallOp>,
       ConvertSCFForOp, ConvertExpandDims, ConvertSCFYieldOp, ConvertSCFIfOp,
       ConvertSCFConditionOp, ConvertSCFWhileOp, ConvertCFCondBranch,

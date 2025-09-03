@@ -151,8 +151,10 @@ class HIPBackend(BaseBackend):
         from triton.language.extra.hip import libdevice
         from triton.language.extra.hip import librocshmem_device
 
-        return {"triton.language.extra.libdevice": libdevice,
-                "triton_dist.language.extra.libshmem_device": librocshmem_device}
+        return {
+            "triton.language.extra.libdevice": libdevice, "triton_dist.language.extra.libshmem_device":
+            librocshmem_device
+        }
 
     def load_dialects(self, ctx):
         distributed.ir.load_dialects(ctx)
