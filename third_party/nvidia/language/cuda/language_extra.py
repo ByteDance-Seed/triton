@@ -154,12 +154,44 @@ def tma_sync(N: core.constexpr = core.constexpr(0), _semantic=None):
 
 
 @core.extern
+def _load_v4_sem_impl(ptr, suffix: core.constexpr, semantic: core.constexpr, _semantic=None):
+    val_type: core.constexpr = _ptx_suffix_to_tl_type(suffix,
+                                                      _semantic=_semantic)
+    c: core.constexpr = _ptx_suffix_to_constraint(suffix, _semantic=_semantic)
+    return tl.inline_asm_elementwise(
+        asm=f"ld.{semantic.value}.global.v4.{suffix.value} {{$0,$1,$2,$3}}, [$4];",
+        constraints=(f"={c.value},={c.value},={c.value},={c.value},l"),
+        args=[ptr],
+        dtype=(val_type, val_type, val_type, val_type),
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def _load_v2_sem_impl(ptr, suffix: core.constexpr, semantic: core.constexpr, _semantic=None):
+    val_type: core.constexpr = _ptx_suffix_to_tl_type(suffix,
+                                                      _semantic=_semantic)
+    c: core.constexpr = _ptx_suffix_to_constraint(suffix, _semantic=_semantic)
+    return tl.inline_asm_elementwise(
+        asm=f"ld.{semantic.value}.global.v2.{suffix.value} {{$0,$1}}, [$2];",
+        constraints=(f"={c.value},={c.value},l"),
+        args=[ptr],
+        dtype=(val_type, val_type),
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+    
+    
+@core.extern
 def _load_v4_impl(ptr, suffix: core.constexpr, _semantic=None):
     val_type: core.constexpr = _ptx_suffix_to_tl_type(suffix,
                                                       _semantic=_semantic)
     c: core.constexpr = _ptx_suffix_to_constraint(suffix, _semantic=_semantic)
     return tl.inline_asm_elementwise(
-        asm=f"ld.volatile.global.v4.{suffix.value} {{$0,$1,$2,$3}}, [$4];",
+        asm=f"ld.global.v4.{suffix.value} {{$0,$1,$2,$3}}, [$4];",
         constraints=(f"={c.value},={c.value},={c.value},={c.value},l"),
         args=[ptr],
         dtype=(val_type, val_type, val_type, val_type),
@@ -175,7 +207,7 @@ def _load_v2_impl(ptr, suffix: core.constexpr, _semantic=None):
                                                       _semantic=_semantic)
     c: core.constexpr = _ptx_suffix_to_constraint(suffix, _semantic=_semantic)
     return tl.inline_asm_elementwise(
-        asm=f"ld.volatile.global.v2.{suffix.value} {{$0,$1}}, [$2];",
+        asm=f"ld.global.v2.{suffix.value} {{$0,$1}}, [$2];",
         constraints=(f"={c.value},={c.value},l"),
         args=[ptr],
         dtype=(val_type, val_type),
@@ -186,25 +218,87 @@ def _load_v2_impl(ptr, suffix: core.constexpr, _semantic=None):
 
 
 @core.extern
-def load_v4_u32(ptr, _semantic=None):
-    return _load_v4_impl(ptr, core.constexpr("u32"), _semantic=_semantic)
+def load_v4_u32(ptr, sem="volatile", _semantic=None):
+    if len(sem) > 0:
+        return _load_v4_sem_impl(ptr, core.constexpr("u32"), core.constexpr(sem), _semantic=_semantic)
+    else:
+        return _load_v4_impl(ptr, core.constexpr("u32"), _semantic=_semantic)
+    
+ld_v4_u32 = load_v4_u32
 
 
 @core.extern
-def load_v4_b32(ptr, _semantic=None):
-    return _load_v4_impl(ptr, core.constexpr("b32"), _semantic=_semantic)
+def load_v4_b32(ptr, sem="volatile", _semantic=None):
+    if len(sem) > 0:
+        return _load_v4_sem_impl(ptr, core.constexpr("b32"), core.constexpr(sem), _semantic=_semantic)
+    else:
+        return _load_v4_impl(ptr, core.constexpr("b32"), _semantic=_semantic)
+    
+ld_v4_b32 = load_v4_b32
 
 
 @core.extern
-def load_v4_s32(ptr, _semantic=None):
-    return _load_v4_impl(ptr, core.constexpr("s32"), _semantic=_semantic)
+def load_v4_s32(ptr, sem="volatile", _semantic=None):
+    if len(sem) > 0:
+        return _load_v4_sem_impl(ptr, core.constexpr("s32"), core.constexpr(sem), _semantic=_semantic)
+    else:
+        return _load_v4_impl(ptr, core.constexpr("s32"), _semantic=_semantic)
+    
+ld_v4_s32 = load_v4_s32
 
 
 @core.extern
-def load_v2_b64(ptr, _semantic=None):
-    return _load_v2_impl(ptr, core.constexpr("b64"), _semantic=_semantic)
+def load_v2_b64(ptr, sem="volatile", _semantic=None):
+    if len(sem) > 0:
+        return _load_v2_sem_impl(ptr, core.constexpr("b64"), core.constexpr(sem), _semantic=_semantic)
+    else:
+        return _load_v2_impl(ptr, core.constexpr("b64"), _semantic=_semantic)
+    
+ld_v2_b64 = load_v2_b64
 
 
+@core.extern
+def _store_v4_sem_impl(ptr,
+                   val0,
+                   val1,
+                   val2,
+                   val3,
+                   suffix: core.constexpr,
+                   semantic: core.constexpr,
+                   _semantic=None):
+    c: core.constexpr = _ptx_suffix_to_constraint(suffix, _semantic=_semantic)
+    return tl.inline_asm_elementwise(
+        asm=f"""
+        st.{semantic.value}.global.v4.{suffix.value} [$1], {{$2,$3,$4,$5}};
+        mov.u32 $0, 0;
+        """,
+        constraints=(
+            f"=r,l,{c.value},{c.value},{c.value},{c.value}"),  # no use output
+        args=[ptr, val0, val1, val2, val3],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+
+
+@core.extern
+def _store_v2_sem_impl(ptr, val0, val1, suffix: core.constexpr, semantic: core.constexpr, _semantic=None):
+    c: core.constexpr = _ptx_suffix_to_constraint(suffix, _semantic=_semantic)
+    return tl.inline_asm_elementwise(
+        asm=f"""
+        st.{semantic.value}.global.v2.{suffix.value} [$1], {{$2,$3}};
+        mov.u32 $0, 0;
+        """,
+        constraints=(f"=r,l,{c.value},{c.value}"),  # no use output
+        args=[ptr, val0, val1],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+    
+    
 @core.extern
 def _store_v4_impl(ptr,
                    val0,
@@ -216,7 +310,7 @@ def _store_v4_impl(ptr,
     c: core.constexpr = _ptx_suffix_to_constraint(suffix, _semantic=_semantic)
     return tl.inline_asm_elementwise(
         asm=f"""
-        st.volatile.global.v4.{suffix.value} [$1], {{$2,$3,$4,$5}};
+        st.global.v4.{suffix.value} [$1], {{$2,$3,$4,$5}};
         mov.u32 $0, 0;
         """,
         constraints=(
@@ -234,7 +328,7 @@ def _store_v2_impl(ptr, val0, val1, suffix: core.constexpr, _semantic=None):
     c: core.constexpr = _ptx_suffix_to_constraint(suffix, _semantic=_semantic)
     return tl.inline_asm_elementwise(
         asm=f"""
-        st.volatile.global.v2.{suffix.value} [$1], {{$2,$3}};
+        st.global.v2.{suffix.value} [$1], {{$2,$3}};
         mov.u32 $0, 0;
         """,
         constraints=(f"=r,l,{c.value},{c.value}"),  # no use output
@@ -247,34 +341,111 @@ def _store_v2_impl(ptr, val0, val1, suffix: core.constexpr, _semantic=None):
 
 
 @core.extern
-def st_v4_u32(ptr, val0, val1, val2, val3, _semantic=None):
-    return _store_v4_impl(tl.cast(ptr, tl.pi32_t, _semantic=_semantic),
+def store_v4_u32(ptr, val0, val1, val2, val3, sem="volatile", _semantic=None):
+    if len(sem) > 0:
+        return _store_v4_sem_impl(tl.cast(ptr, tl.pi32_t, _semantic=_semantic),
+                          val0,
+                          val1,
+                          val2,
+                          val3,
+                          core.constexpr("u32"),
+                          core.constexpr(sem),
+                          _semantic=_semantic)
+    else:
+        return _store_v4_impl(tl.cast(ptr, tl.pi32_t, _semantic=_semantic),
                           val0,
                           val1,
                           val2,
                           val3,
                           core.constexpr("u32"),
                           _semantic=_semantic)
+        
+st_v4_u32 = store_v4_u32
 
 
 @core.extern
-def st_v4_b32(ptr, val0, val1, val2, val3, _semantic=None):
-    return _store_v4_impl(tl.cast(ptr, tl.pi32_t, _semantic=_semantic),
-                          val0,
-                          val1,
-                          val2,
-                          val3,
-                          core.constexpr("b32"),
-                          _semantic=_semantic)
+def store_v4_b32(ptr, val0, val1, val2, val3, sem="volatile", _semantic=None):
+    if len(sem) > 0:
+        return _store_v4_sem_impl(tl.cast(ptr, tl.pi32_t, _semantic=_semantic),
+                            val0,
+                            val1,
+                            val2,
+                            val3,
+                            core.constexpr("b32"),
+                            core.constexpr(sem),
+                            _semantic=_semantic)
+    else:
+        return _store_v4_impl(tl.cast(ptr, tl.pi32_t, _semantic=_semantic),
+                            val0,
+                            val1,
+                            val2,
+                            val3,
+                            core.constexpr("b32"),
+                            _semantic=_semantic)
+        
+st_v4_b32 = store_v4_b32
 
 
 @core.extern
-def st_v2_u32(ptr, val0, val1, _semantic=None):
-    return _store_v2_impl(tl.cast(ptr, tl.pi32_t, _semantic=_semantic),
-                          val0,
-                          val1,
-                          core.constexpr("u32"),
-                          _semantic=_semantic)
+def store_v2_u32(ptr, val0, val1, sem="volatile", _semantic=None):
+    if len(sem) > 0:
+        return _store_v2_sem_impl(tl.cast(ptr, tl.pi32_t, _semantic=_semantic),
+                            val0,
+                            val1,
+                            core.constexpr("u32"),
+                            core.constexpr(sem),
+                            _semantic=_semantic)
+    else:
+        return _store_v2_impl(tl.cast(ptr, tl.pi32_t, _semantic=_semantic),
+                            val0,
+                            val1,
+                            core.constexpr("u32"),
+                            _semantic=_semantic)
+        
+st_v2_u32 = store_v2_u32
+
+
+@core.extern
+def load_v4_b32_cond(ptr, mask, _semantic=None):
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $5, 1;
+            @%p0 ld.global.v4.b32 {$0,$1,$2,$3}, [$4];
+        }
+        """,
+        constraints=("=r,=r,=r,=r,l,r"),
+        args=[ptr, mask.to(tl.int32, _semantic=_semantic)],
+        dtype=(tl.int32, tl.int32, tl.int32, tl.int32),
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+    
+ld_v4_b32_cond = load_v4_b32_cond
+
+
+@core.extern
+def store_v4_b32_cond(ptr, val0, val1, val2, val3, mask, _semantic=None):
+    return tl.inline_asm_elementwise(
+        asm="""
+        {
+            .reg .pred %p0;
+            setp.eq.s32 %p0, $6, 1;
+            @%p0 st.global.v4.b32 [$1], {$2,$3,$4,$5};
+            mov.u32 $0, 0;
+        }
+        """,
+        constraints=("=r,l,r,r,r,r,r"),  # no use output
+        args=[ptr, val0, val1, val2, val3, mask.to(tl.int32, _semantic=_semantic)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
+    
+st_v4_b32_cond = store_v4_b32_cond
 
 
 @core.extern
