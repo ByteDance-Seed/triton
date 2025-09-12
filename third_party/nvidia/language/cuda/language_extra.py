@@ -406,7 +406,7 @@ st_v2_u32 = store_v2_u32
 
 
 @core.extern
-def load_v4_b32_cond(ptr, mask, _semantic=None):
+def load_v4_p_b32(ptr, mask, _semantic=None):
     return tl.inline_asm_elementwise(
         asm="""
         {
@@ -427,7 +427,7 @@ ld_v4_b32_cond = load_v4_b32_cond
 
 
 @core.extern
-def store_v4_b32_cond(ptr, val0, val1, val2, val3, mask, _semantic=None):
+def store_v4_p_b32(ptr, val0, val1, val2, val3, mask, _semantic=None):
     return tl.inline_asm_elementwise(
         asm="""
         {
