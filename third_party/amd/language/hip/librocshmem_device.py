@@ -473,28 +473,28 @@ def putmem_signal_nbi_wave(dest,
 
 
 
-@core.extern
-def wait_until(sig_addr, cmp_, cmp_val, _semantic=None):
-    tl.static_assert(sig_addr.dtype == pi_u64_t or sig_addr.dtype == pi_i64_t,
-                     "sig_addr should be a pointer of uint64_t/int64_t",
-                     _semantic=_semantic)
-    return extern_call(
-        "librocshmem_device",
-        "",
-        [
-            tl.cast(sig_addr, pi_u64_t, _semantic=_semantic),
-            tl.cast(cmp_, tl.int32, _semantic=_semantic),
-            tl.cast(cmp_val, tl.uint64, _semantic=_semantic),
-        ],  # no cast
-        {
-            (pi_u64_t, tl.int32, tl.uint64): (
-                "rocshmem_wait_until_wrapper",
-                (),
-            ),
-        },
-        is_pure=False,
-        _semantic=_semantic,
-    )
+# @core.extern
+# def wait_until(sig_addr, cmp_, cmp_val, _semantic=None):
+#     tl.static_assert(sig_addr.dtype == pi_u64_t or sig_addr.dtype == pi_i64_t,
+#                      "sig_addr should be a pointer of uint64_t/int64_t",
+#                      _semantic=_semantic)
+#     return extern_call(
+#         "librocshmem_device",
+#         "",
+#         [
+#             tl.cast(sig_addr, pi_u64_t, _semantic=_semantic),
+#             tl.cast(cmp_, tl.int32, _semantic=_semantic),
+#             tl.cast(cmp_val, tl.uint64, _semantic=_semantic),
+#         ],  # no cast
+#         {
+#             (pi_u64_t, tl.int32, tl.uint64): (
+#                 "rocshmem_wait_until_wrapper",
+#                 (),
+#             ),
+#         },
+#         is_pure=False,
+#         _semantic=_semantic,
+#     )
 
 
 @core.extern
@@ -535,7 +535,7 @@ def fence(_semantic=None):
         "",
         [],
         {
-            (): ("rocshmem_fence", ()),
+            (): ("rocshmem_fence_wrapper", ()),
         },
         is_pure=False,
         _semantic=_semantic,
