@@ -8,6 +8,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/Triton/Transforms/Passes.h"
+#include "TritonDistributed/Dialect/Distributed/IR/Dialect.h"
 
 namespace mlir::triton {
 
@@ -47,6 +48,10 @@ public:
   unsigned int length() const { return shape.size(); }
 
   Value getOffset(unsigned i) { return offsets[i]; }
+
+  Value getBase() { return base; }
+
+  void setBase(Value newBase) { base = newBase; }
 
   SmallVector<Value> getOffsets() { return offsets; }
 
@@ -274,6 +279,23 @@ public:
     return nullptr;
   }
 
+  Operation *rewriteConsumeTokenOp(OpBuilder &builder, triton::distributed::ConsumeTokenOp op,
+    std::stack<Operation *> &eraser) {
+    // Get info from previous results
+    if (rewritedInfo.count(op.getInput())) {
+      auto info = rewritedInfo[op.getInput()];
+
+
+      Value result = builder.create<triton::distributed::ConsumeTokenOp>(
+        op.getLoc(), info.getBase(), op.getToken());
+      info.setBase(result);
+      rewritedInfo[op.getResult()] = info;
+      // Erase the original operation
+      eraser.push(op);
+    }
+    return nullptr;
+  }
+
   Operation *rewriteLoadStoreOp(OpBuilder &builder, Operation *op,
                                 std::stack<Operation *> &eraser) {
     assert(isa<triton::LoadOp>(op) || isa<triton::StoreOp>(op));
@@ -498,6 +520,8 @@ public:
       return rewriteAdvanceOp(builder, advanceOp, eraser);
     } else if (isa<triton::LoadOp>(op) || isa<triton::StoreOp>(op)) {
       return rewriteLoadStoreOp(builder, op, eraser);
+    } else if (auto consumeTokenOp = dyn_cast<triton::distributed::ConsumeTokenOp>(op)) {
+      return rewriteConsumeTokenOp(builder, consumeTokenOp, eraser);
     } else if (isa<scf::SCFDialect, cf::ControlFlowDialect>(op->getDialect())) {
       if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
         return rewriteIfOp(builder, ifOp, eraser);
