@@ -24,4 +24,5 @@ add_triton_library(TritonTransforms
   MLIRTransforms
   MLIRSCFToControlFlow
   TritonIR
+  DistributedIR
 )
