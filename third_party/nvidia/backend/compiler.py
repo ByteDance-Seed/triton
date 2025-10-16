@@ -325,6 +325,7 @@ class CUDAOptions:
     max_num_imprecise_acc_default: bool = None
     extern_libs: dict = None
     nvshmem_device_lib: str = ""
+    omnishmem_device_lib: str = ""
     debug: bool = False
     backend_name: str = 'cuda'
     sanitize_overflow: bool = True
@@ -338,10 +339,12 @@ class CUDAOptions:
         nvshmem_libdir = NVSHMEMHelper.get_nvshmem_lib()
         nvshmem_device_lib = os.getenv("NVSHMEM_LIBDEVICE_PATH", None) or str(nvshmem_libdir / 'libnvshmem_device.bc')
         nvshmemi_device_lib = os.getenv("NVSHMEMI_LIBDEVICE_PATH", None) or str(nvshmem_libdir / 'libnvshmemi_device.bc')
+        omnishmem_device_lib = knobs.nvidia.libdevice_path or str(default_libdir / 'libomnishmem_adaptor_device.bc')
 
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         object.__setattr__(self, 'nvshmem_device_lib', nvshmem_device_lib)
         object.__setattr__(self, 'nvshmemi_device_lib', nvshmemi_device_lib)
+        object.__setattr__(self, 'omnishmem_device_lib', omnishmem_device_lib)
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
                "num_warps must be a power of 2"
 
@@ -418,8 +421,10 @@ class CUDABackend(BaseBackend):
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.cuda import libdevice
         from triton.language.extra.cuda import libnvshmem_device
+        from triton.language.extra.cuda import libomnishmem_adaptor_device
         return {"triton.language.extra.libdevice": libdevice,
-                "triton_dist.language.extra.libshmem_device": libnvshmem_device,}
+                "triton_dist.language.extra.libshmem_device": libnvshmem_device,
+                "triton_dist.language.extra.libomnishmem_device": libomnishmem_adaptor_device}
 
     def load_dialects(self, ctx):
         distributed.ir.load_dialects(ctx)
@@ -600,6 +605,10 @@ class CUDABackend(BaseBackend):
             if os.path.exists(options.nvshmemi_device_lib):
                 # optional: if user don't want to compile the bitcode, just ignore it and can't use nvshmemi functions
                 llvm.link_extern_libs(llvm_mod, [options.nvshmemi_device_lib])
+        
+        # Link omnishmem adaptor library if it exists
+        if options.omnishmem_device_lib and os.path.exists(options.omnishmem_device_lib):
+            llvm.link_extern_libs(llvm_mod, [options.omnishmem_device_lib])
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
 
         # Get some metadata
