@@ -85,10 +85,13 @@ class HIPOptions:
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         for lib in ["ocml", "ockl"]:
             extern_libs[lib] = str(default_libdir / f'{lib}.bc')
+
+        libdevice_extra = str(default_libdir / f"libdevice_extra.ll")
         rocshmem_device_lib = str(default_libdir / 'librocshmem_device.bc')
 
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         object.__setattr__(self, 'rocshmem_device_lib', rocshmem_device_lib)
+        object.__setattr__(self, 'libdevice_extra', libdevice_extra)
 
     def hash(self):
         key = '_'.join([f'{name}-{val}' for name, val in self.__dict__.items()])
@@ -406,6 +409,9 @@ class HIPBackend(BaseBackend):
         elif options.extern_libs:
             paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name)]
             llvm.link_extern_libs(llvm_mod, paths)
+
+        if options.libdevice_extra:
+            llvm.link_extern_libs(llvm_mod, [options.libdevice_extra])
 
         if options.rocshmem_device_lib and metadata['use_rocshmem']:
             llvm.link_extern_libs(llvm_mod, [options.rocshmem_device_lib])
