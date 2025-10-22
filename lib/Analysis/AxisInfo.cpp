@@ -1053,6 +1053,7 @@ AxisInfoAnalysis::AxisInfoAnalysis(DataFlowSolver &solver,
   // Distributed ops
   visitors
       .append<BarrierOpAxisInfoVisitor<triton::distributed::ConsumeTokenOp>>();
+  visitors.append<CastOpAxisInfoVisitor<triton::distributed::SymmAtOp>>();
 
   if (callback)
     callback(visitors);
