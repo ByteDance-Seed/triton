@@ -88,6 +88,68 @@ def atomic_cas(ptr, val, target_val, semantic="monotonic", scope="agent", _seman
 def sync_grid(_semantic=None):
     return dist_core.extern_elementwise(
         "", "", [], {
-            tuple(): (f"__ockl_grid_sync", core.dtype("int32")), # does not return
+            tuple(): ("__ockl_grid_sync", core.dtype("int32")), # does not return
+        }, is_pure=False, _semantic=_semantic
+    )
+
+@core.extern
+def smid(_semantic=None):
+    # now only support GFX942
+    return dist_core.extern_elementwise(
+        "", "", [], {
+            tuple(): ("__extra_smid", core.dtype("int32")), # does not return
+        }, is_pure=True, _semantic=_semantic
+    )
+
+@core.extern
+def seid(_semantic=None):
+    # now only support GFX942
+    return dist_core.extern_elementwise(
+        "", "", [], {
+            tuple(): ("__extra_seid", core.dtype("int32")), # does not return
+        }, is_pure=True, _semantic=_semantic
+    )
+
+@core.extern
+def cuid(_semantic=None):
+    # now only support GFX942
+    return dist_core.extern_elementwise(
+        "", "", [], {
+            tuple(): ("__extra_cuid", core.dtype("int32")), # does not return
+        }, is_pure=True, _semantic=_semantic
+    )
+
+@core.extern
+def xccid(_semantic=None):
+    # now only support GFX942
+    return dist_core.extern_elementwise(
+        "", "", [], {
+            tuple(): ("__extra_xccid", core.dtype("int32")), # does not return
+        }, is_pure=True, _semantic=_semantic
+    )
+
+@core.extern
+def clock(_semantic=None):
+    return dist_core.extern_elementwise(
+        "", "", [], {
+            tuple(): ("__extra_clock", core.dtype("uint64")), # does not return
+        }, is_pure=False, _semantic=_semantic
+    )
+
+@core.extern
+def wallclock(_semantic=None):
+    """ strange that wallclock is not in unit of nanosecond, but 10*nanosecond. no doc found for that """
+    return dist_core.extern_elementwise(
+        "", "", [], {
+            tuple(): ("__extra_wallclock", core.dtype("uint64")), # does not return
+        }, is_pure=False, _semantic=_semantic
+    )
+
+@core.extern
+def fence(semantic="monotonic", scope="agent", _semantic=None):
+    return dist_core.extern_elementwise(
+
+        "", "", [], {
+            tuple(): (f"__extra_fence_{core._unwrap_if_constexpr(semantic)}_{core._unwrap_if_constexpr(scope)}", core.dtype("int32")), # does not return
         }, is_pure=False, _semantic=_semantic
     )
