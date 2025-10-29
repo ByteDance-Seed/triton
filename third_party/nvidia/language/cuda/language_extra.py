@@ -106,19 +106,6 @@ def _ptx_suffix_to_tl_type(suffix: core.constexpr, _semantic=None):
 
 
 @core.extern
-def pack_b32_v2(val0, val1, _semantic=None):
-    return tl.inline_asm_elementwise(
-        asm="mov.b64 $0, {$1, $2};",
-        constraints=("=l,r,r"),
-        args=[val0, val1],
-        dtype=tl.uint64,
-        is_pure=True,
-        pack=1,
-        _semantic=_semantic,
-    )
-
-
-@core.extern
 def __syncthreads(_semantic=None):
     return tl.tensor(_semantic.builder.create_barrier(), tl.void)
 
@@ -1035,6 +1022,21 @@ def membar(scope: core.constexpr = core.constexpr("cta"), _semantic=None):
         _semantic=_semantic,
     )
 
+
+@core.extern
+def fence(semantic: core.constexpr = core.constexpr("sc"), scope: core.constexpr = core.constexpr("gpu"), _semantic=None):
+    return tl.inline_asm_elementwise(
+        asm=f"""
+        fence.{core._unwrap_if_constexpr(semantic)}.{core._unwrap_if_constexpr(scope)};
+        mov.u32 $0, 0;
+        """,
+        constraints=("=r"),
+        args=[],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+        _semantic=_semantic,
+    )
 
 __all__ = [
     "__syncthreads",
