@@ -113,7 +113,7 @@ def my_pe(_semantic=None):
 @core.extern
 def device_nvshmem_my_pe(_semantic=None):
     return extern_call(
-        "libomnishmem_adaptor_device",
+        "libnvshmem_device",
         "",
         [],
         {
@@ -470,26 +470,6 @@ def _putmem_impl(dest, source, nbytes, pe, SCOPE_SUFFIX: core.constexpr, NBI: co
             (tl.pointer_type(tl.void), tl.pointer_type(tl.void), tl.uint64, tl.int32): (
                 f"omnishmem{'x' if SCOPE_SUFFIX.value else ''}_putmem{NBI.value}{SCOPE_SUFFIX.value}",
                 (),
-            ),
-        },
-        is_pure=False,
-        _semantic=_semantic,
-    )
-
-@core.extern
-def nvshmem_putmem_nbi_block(dest, source, nbytes, pe, _semantic=None):
-    return extern_call(
-        "libomnishmem_adaptor_device",
-        "",
-        [
-            tl.cast(dest, tl.pointer_type(tl.void), _semantic=_semantic),
-            tl.cast(source, tl.pointer_type(tl.void), _semantic=_semantic),
-            tl.cast(nbytes, tl.uint64, _semantic=_semantic),
-            tl.cast(pe, tl.int32, _semantic=_semantic),
-        ],
-        {
-            (tl.pointer_type(tl.void), tl.pointer_type(tl.void), tl.uint64, tl.int32): (
-                "nvshmemx_putmem_nbi_block", (),
             ),
         },
         is_pure=False,
@@ -886,12 +866,13 @@ def fcollect_block(team, dest, source, nelems, _semantic=None):
         _semantic=_semantic,
     )
 
+# === support in libomnishmem_transfer_device.bc ===
 
 @core.extern
 def _putmem_rma_impl(dest, source, nbytes, pe, SCOPE_SUFFIX: core.constexpr, NBI: core.constexpr = core.constexpr(""),
                      _semantic=None):
     return extern_call(
-        "libomnishmem_adaptor_device",
+        "libomnishmem_transfer_device",
         "",
         [
             tl.cast(dest, tl.pointer_type(tl.void), _semantic=_semantic),
@@ -901,7 +882,7 @@ def _putmem_rma_impl(dest, source, nbytes, pe, SCOPE_SUFFIX: core.constexpr, NBI
         ],
         {
             (tl.pointer_type(tl.void), tl.pointer_type(tl.void), tl.uint64, tl.int32): (
-                f"omnishmemi_transfer_rma_put{NBI.value}{SCOPE_SUFFIX.value}",
+                f"nvshmemi_transfer_rma_put{NBI.value}{SCOPE_SUFFIX.value}",
                 (),
             ),
         },
@@ -947,7 +928,7 @@ def _putmem_signal_rma_impl(dest, source, nbytes, sig_addr, signal, sig_op, pe, 
                             NBI: core.constexpr = core.constexpr(""), _semantic=None):
     tl.static_assert(sig_addr.dtype == pi_u64_t, "sig_addr should be a pointer of uint64_t", _semantic=_semantic)
     return extern_call(
-        "libomnishmem_adaptor_device",
+        "libomnishmem_transfer_device",
         "",
         [
             tl.cast(dest, tl.pointer_type(tl.void), _semantic=_semantic),
@@ -960,8 +941,7 @@ def _putmem_signal_rma_impl(dest, source, nbytes, sig_addr, signal, sig_op, pe, 
         ],
         {
             (tl.pointer_type(tl.void), tl.pointer_type(tl.void), tl.uint64, pi_u64_t, tl.uint64, tl.int32, tl.int32): (
-                # omnishmemi_transfer_put_signal_nbi
-                f"omnishmemi_transfer_put_signal{NBI.value}{SCOPE_SUFFIX.value}",
+                f"nvshmemi_transfer_put_signal{NBI.value}{SCOPE_SUFFIX.value}",
                 (),
             ),
         },
@@ -1004,3 +984,16 @@ def putmem_signal_rma_nbi_warp(dest, source, nbytes, sig_addr, signal, sig_op, p
 def putmem_signal_rma_nbi_block(dest, source, nbytes, sig_addr, signal, sig_op, pe, _semantic=None):
     return _putmem_signal_rma_impl(dest, source, nbytes, sig_addr, signal, sig_op, pe, core.constexpr("_block"),
                                    core.constexpr("_nbi"), _semantic=_semantic)
+
+@core.extern
+def get_ibgda_init_state(state, pe, _semantic=None):
+    return extern_call(
+        "libomnishmem_transfer_device",
+        "",
+        [state, tl.cast(pe, tl.int32, _semantic=_semantic)],
+        {
+            (tl.pointer_type(tl.uint64), tl.int32): ("omnishmem_check_ibgda_state", ())
+        },
+        is_pure=False,
+        _semantic=_semantic,
+    )

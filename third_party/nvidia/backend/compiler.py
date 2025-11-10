@@ -21,6 +21,8 @@ from pathlib import Path
 import sysconfig
 from string import Template
 
+def check_env_flag(name: str, default: str = "") -> bool:
+    return os.getenv(name, default).upper() in ["ON", "1", "YES", "TRUE", "Y"]
 
 def min_dot_size(target: GPUTarget):
 
@@ -326,6 +328,7 @@ class CUDAOptions:
     extern_libs: dict = None
     nvshmem_device_lib: str = ""
     omnishmem_device_lib: str = ""
+    omnishmem_transfer_device_lib: str = ""
     debug: bool = False
     backend_name: str = 'cuda'
     sanitize_overflow: bool = True
@@ -338,13 +341,15 @@ class CUDAOptions:
             extern_libs['libdevice'] = knobs.nvidia.libdevice_path or str(default_libdir / 'libdevice.10.bc')
         nvshmem_libdir = NVSHMEMHelper.get_nvshmem_lib()
         nvshmem_device_lib = os.getenv("NVSHMEM_LIBDEVICE_PATH", None) or str(nvshmem_libdir / 'libnvshmem_device.bc')
-        nvshmemi_device_lib = os.getenv("NVSHMEMI_LIBDEVICE_PATH", None) or str(nvshmem_libdir / 'libnvshmemi_device.bc')
+        nvshmemi_device_lib = os.getenv("NVSHMEMI_LIBDEVICE_PATH", None) or str(default_libdir / 'libnvshmemi_device.bc')
         omnishmem_device_lib = knobs.nvidia.libdevice_path or str(default_libdir / 'libomnishmem_adaptor_device.bc')
+        omnishmem_transfer_device_lib = os.getenv("OMNISHMEM_LIBDEVICE_PATH", None) or str(default_libdir / 'libomnishmem_transfer_device.bc')
 
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
         object.__setattr__(self, 'nvshmem_device_lib', nvshmem_device_lib)
         object.__setattr__(self, 'nvshmemi_device_lib', nvshmemi_device_lib)
         object.__setattr__(self, 'omnishmem_device_lib', omnishmem_device_lib)
+        object.__setattr__(self, 'omnishmem_transfer_device_lib', omnishmem_transfer_device_lib)
         assert self.num_warps > 0 and (self.num_warps & (self.num_warps - 1)) == 0, \
                "num_warps must be a power of 2"
 
@@ -424,7 +429,8 @@ class CUDABackend(BaseBackend):
         from triton.language.extra.cuda import libomnishmem_adaptor_device
         return {"triton.language.extra.libdevice": libdevice,
                 "triton_dist.language.extra.libshmem_device": libnvshmem_device,
-                "triton_dist.language.extra.libomnishmem_device": libomnishmem_adaptor_device}
+                "triton_dist.language.extra.libomnishmem_device": libomnishmem_adaptor_device,
+                }
 
     def load_dialects(self, ctx):
         distributed.ir.load_dialects(ctx)
@@ -600,16 +606,26 @@ class CUDABackend(BaseBackend):
         if options.extern_libs:
             paths = [path for (name, path) in options.extern_libs]
             llvm.link_extern_libs(llvm_mod, paths)
-        if options.nvshmem_device_lib and metadata['use_nvshmem'] and not metadata['use_nvshmem_wrapper']:
+        if options.nvshmem_device_lib: # and metadata['use_nvshmem'] and not metadata['use_nvshmem_wrapper']:
             llvm.link_extern_libs(llvm_mod, [options.nvshmem_device_lib])
-            if os.path.exists(options.nvshmemi_device_lib):
+            print("link nvshmem_device", options.nvshmem_device_lib)
+            # since omnishmem_transfer_device is conflict with nvshmemi_device_lib,
+            # the nvshmemi_device_lib is not linked when the omnishmem enabled.
+            if os.path.exists(options.nvshmemi_device_lib) and not check_env_flag("TRITON_DISTRIBUTED_ENABLE_OMNISHMEM"):
                 # optional: if user don't want to compile the bitcode, just ignore it and can't use nvshmemi functions
                 llvm.link_extern_libs(llvm_mod, [options.nvshmemi_device_lib])
+                print("[INFO] link nvshmemi_device", options.nvshmemi_device_lib)
         
         # Link omnishmem adaptor library if it exists
         if options.omnishmem_device_lib and os.path.exists(options.omnishmem_device_lib):
             llvm.link_extern_libs(llvm_mod, [options.omnishmem_device_lib])
-        llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
+            print("[INFO] link omnishmem_device_lib", options.omnishmem_device_lib)
+        # Link omnishmem transfer device library if the omnishmem enabled
+        if os.path.exists(options.omnishmem_transfer_device_lib) and check_env_flag("TRITON_DISTRIBUTED_ENABLE_OMNISHMEM"):
+            llvm.link_extern_libs(llvm_mod, [options.omnishmem_transfer_device_lib])
+            print("[INFO] link omnishmem_transfer_device_lib", options.omnishmem_transfer_device_lib)
+        if not check_env_flag("TRITON_DISTRIBUTED_ENABLE_OMNISHMEM"):
+            llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3)
 
         # Get some metadata
         # warp-specialization mutates num_warps
