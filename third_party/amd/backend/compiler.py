@@ -86,12 +86,7 @@ class HIPOptions:
         for lib in ["ocml", "ockl"]:
             extern_libs[lib] = str(default_libdir / f'{lib}.bc')
 
-        libdevice_extra = str(default_libdir / f"libdevice_extra.ll")
-        rocshmem_device_lib = str(default_libdir / 'librocshmem_device.bc')
-
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
-        object.__setattr__(self, 'rocshmem_device_lib', rocshmem_device_lib)
-        object.__setattr__(self, 'libdevice_extra', libdevice_extra)
 
     def hash(self):
         key = '_'.join([f'{name}-{val}' for name, val in self.__dict__.items()])
@@ -387,11 +382,6 @@ class HIPBackend(BaseBackend):
         # to user SGPRs so that the kernel does not need to s_load its arguments
         # from memory.
         amd.set_all_fn_arg_inreg(fns[0])
-        metadata['use_rocshmem'] = False
-        for k in llvm_mod.get_functions():
-            if "rocshmem" in k.name and k.is_declaration():
-                metadata['use_rocshmem'] = True
-                break
 
         if knobs.compilation.enable_asan:
             default_libdir = Path(__file__).parent / 'lib'
@@ -400,16 +390,15 @@ class HIPBackend(BaseBackend):
                 str(default_libdir / "ocml.bc"),
                 str(default_libdir / "ockl.bc")
             ]
+
+            for (name, path) in options.extern_libs:
+                if name in ["asanrtl", "ocml", "ockl"]:
+                    continue
+                paths.append(path)
             llvm.link_extern_libs(llvm_mod, paths)
         elif options.extern_libs:
-            paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name)]
+            paths = [path for (name, path) in options.extern_libs]
             llvm.link_extern_libs(llvm_mod, paths)
-
-        if options.libdevice_extra:
-            llvm.link_extern_libs(llvm_mod, [options.libdevice_extra])
-
-        if options.rocshmem_device_lib and metadata['use_rocshmem']:
-            llvm.link_extern_libs(llvm_mod, [options.rocshmem_device_lib])
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion)
 
