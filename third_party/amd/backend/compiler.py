@@ -152,12 +152,7 @@ class HIPBackend(BaseBackend):
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.hip import libdevice
-        from triton.language.extra.hip import librocshmem_device
-
-        return {
-            "triton.language.extra.libdevice": libdevice, "triton_dist.language.extra.libshmem_device":
-            librocshmem_device
-        }
+        return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
         distributed.ir.load_dialects(ctx)
@@ -489,6 +484,8 @@ class HIPBackend(BaseBackend):
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
         stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
+        if knobs.runtime.add_stages_inspection_hook is not None:
+            knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
     @functools.lru_cache()
     def hash(self):
