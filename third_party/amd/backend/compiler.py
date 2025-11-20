@@ -383,6 +383,7 @@ class HIPBackend(BaseBackend):
         # from memory.
         amd.set_all_fn_arg_inreg(fns[0])
 
+        # builtin lib
         if knobs.compilation.enable_asan:
             default_libdir = Path(__file__).parent / 'lib'
             paths = [
@@ -390,15 +391,14 @@ class HIPBackend(BaseBackend):
                 str(default_libdir / "ocml.bc"),
                 str(default_libdir / "ockl.bc")
             ]
-
-            for (name, path) in options.extern_libs:
-                if name in ["asanrtl", "ocml", "ockl"]:
-                    continue
-                paths.append(path)
             llvm.link_extern_libs(llvm_mod, paths)
         elif options.extern_libs:
-            paths = [path for (name, path) in options.extern_libs]
+            paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name) and name in ["ocml", "ockl"]]
             llvm.link_extern_libs(llvm_mod, paths)
+
+        # user lib
+        paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name) and name not in ["ocml", "ockl"]]
+        llvm.link_extern_libs(llvm_mod, paths)
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion)
 
