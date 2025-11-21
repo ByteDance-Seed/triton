@@ -86,12 +86,7 @@ class HIPOptions:
         for lib in ["ocml", "ockl"]:
             extern_libs[lib] = str(default_libdir / f'{lib}.bc')
 
-        libdevice_extra = str(default_libdir / f"libdevice_extra.ll")
-        rocshmem_device_lib = str(default_libdir / 'librocshmem_device.bc')
-
         object.__setattr__(self, 'extern_libs', tuple(extern_libs.items()))
-        object.__setattr__(self, 'rocshmem_device_lib', rocshmem_device_lib)
-        object.__setattr__(self, 'libdevice_extra', libdevice_extra)
 
     def hash(self):
         key = '_'.join([f'{name}-{val}' for name, val in self.__dict__.items()])
@@ -152,12 +147,7 @@ class HIPBackend(BaseBackend):
 
     def get_module_map(self) -> Dict[str, ModuleType]:
         from triton.language.extra.hip import libdevice
-        from triton.language.extra.hip import librocshmem_device
-
-        return {
-            "triton.language.extra.libdevice": libdevice, "triton_dist.language.extra.libshmem_device":
-            librocshmem_device
-        }
+        return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
         distributed.ir.load_dialects(ctx)
@@ -392,12 +382,8 @@ class HIPBackend(BaseBackend):
         # to user SGPRs so that the kernel does not need to s_load its arguments
         # from memory.
         amd.set_all_fn_arg_inreg(fns[0])
-        metadata['use_rocshmem'] = False
-        for k in llvm_mod.get_functions():
-            if "rocshmem" in k.name and k.is_declaration():
-                metadata['use_rocshmem'] = True
-                break
 
+        # builtin lib
         if knobs.compilation.enable_asan:
             default_libdir = Path(__file__).parent / 'lib'
             paths = [
@@ -407,14 +393,12 @@ class HIPBackend(BaseBackend):
             ]
             llvm.link_extern_libs(llvm_mod, paths)
         elif options.extern_libs:
-            paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name)]
+            paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name) and name in ["ocml", "ockl"]]
             llvm.link_extern_libs(llvm_mod, paths)
 
-        if options.libdevice_extra:
-            llvm.link_extern_libs(llvm_mod, [options.libdevice_extra])
-
-        if options.rocshmem_device_lib and metadata['use_rocshmem']:
-            llvm.link_extern_libs(llvm_mod, [options.rocshmem_device_lib])
+        # user lib
+        paths = [path for (name, path) in options.extern_libs if amd.need_extern_lib(llvm_mod, name) and name not in ["ocml", "ockl"]]
+        llvm.link_extern_libs(llvm_mod, paths)
 
         llvm.optimize_module(llvm_mod, llvm.OPTIMIZE_O3, options.arch, '', [], options.enable_fp_fusion)
 
@@ -489,6 +473,8 @@ class HIPBackend(BaseBackend):
         stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options)
         stages["amdgcn"] = lambda src, metadata: self.make_amdgcn(src, metadata, options)
         stages["hsaco"] = lambda src, metadata: self.make_hsaco(src, metadata, options)
+        if knobs.runtime.add_stages_inspection_hook is not None:
+            knobs.runtime.add_stages_inspection_hook(self, stages, options, language, None)
 
     @functools.lru_cache()
     def hash(self):
