@@ -284,8 +284,6 @@ public:
     // Get info from previous results
     if (rewritedInfo.count(op.getInput())) {
       auto info = rewritedInfo[op.getInput()];
-
-
       Value result = builder.create<triton::distributed::ConsumeTokenOp>(
         op.getLoc(), info.getBase(), op.getToken());
       info.setBase(result);

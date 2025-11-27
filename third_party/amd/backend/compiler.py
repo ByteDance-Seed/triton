@@ -1,7 +1,6 @@
 ################################################################################
 # Modification Copyright 2025 ByteDance Ltd. and/or its affiliates.
 ################################################################################
-## TODO: add rocshmem support
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
 from triton._C.libtriton import ir, passes, llvm, amd, distributed
 from triton import knobs
@@ -335,9 +334,7 @@ class HIPBackend(BaseBackend):
             amd.passes.ttgpuir.lower_instruction_sched_hints(pm, options.arch, options.num_stages)
         if not knobs.compilation.disable_line_info:
             passes.llvmir.add_di_scope(pm)
-        # TritonDistributed Extension: libdevice -> llvm
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, __HIP_FTZ)
-        distributed.passes.ttgpuir.amd.add_lib_device_to_llvmir(pm, __HIP_FTZ)
         pm.run(mod)
 
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
@@ -414,7 +411,6 @@ class HIPBackend(BaseBackend):
         amd.disable_print_inline(llvm_mod)
         return str(llvm_mod)
 
-    ## TODO: [AMD] integrate with rocshmem
     @staticmethod
     def make_amdgcn(src, metadata, options):
         # Find kernel names (there should only be one)
@@ -423,16 +419,6 @@ class HIPBackend(BaseBackend):
         names = re.findall(r"define amdgpu_kernel void @([a-zA-Z_][a-zA-Z0-9_]*)", src)
         assert len(names) == 1
         metadata["name"] = names[0]
-
-        # Debug llir issue from rocshmem bitcode
-        if os.environ.get("LLIR_ENABLE_DUMP", "0") == "1":
-            with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ll') as ll_file:
-                ll_file.write(src)
-                ll_path = ll_file.name
-                with open(ll_path) as f:
-                    print("// -----// LLIR Dump //----- //")
-                    print(f.read())
-
         # llvm -> hsaco
         flags = []
         # The sink-insts-to-avoid-spills flag asks LLVM backend to sink instructions
