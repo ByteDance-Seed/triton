@@ -334,7 +334,9 @@ class HIPBackend(BaseBackend):
             amd.passes.ttgpuir.lower_instruction_sched_hints(pm, options.arch, options.num_stages)
         if not knobs.compilation.disable_line_info:
             passes.llvmir.add_di_scope(pm)
+        # TritonDistributed Extension: builtin -> llvm
         amd.passes.ttgpuir.add_builtin_func_to_llvmir(pm, __HIP_FTZ)
+        distributed.passes.ttgpuir.amd.add_builtin_func_to_llvmir_ext(pm, __HIP_FTZ)
         pm.run(mod)
 
         # LLVM-IR (MLIR) -> LLVM-IR (LLVM)
