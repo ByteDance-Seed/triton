@@ -1,5 +1,5 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton._C.libtriton import ir, passes, llvm, nvidia
+from triton._C.libtriton import ir, passes, llvm, nvidia, distributed
 from triton import knobs
 from triton.runtime.errors import PTXASError
 
@@ -221,6 +221,7 @@ class CUDABackend(BaseBackend):
         return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
+        distributed.ir.load_dialects(ctx)
         nvidia.load_dialects(ctx)
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.load_dialects(ctx)
@@ -255,7 +256,8 @@ class CUDABackend(BaseBackend):
             cluster_info.clusterDimZ = opt.cluster_dims[2]
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
-        passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        # TritonDistributed Extension
+        distributed.passes.ttir.add_convert_to_ttgpuir_ext(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         if capability // 10 >= 8:
@@ -360,6 +362,8 @@ class CUDABackend(BaseBackend):
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
+        # TritonDistributed Extension: Distributed/SIMT Dialect -> LLVM
+        distributed.passes.ttgpuir.nvidia.add_convert_triton_distributed_to_llvm(pm, capability, ptx_version)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 import hashlib
 import json
-from .._C.libtriton import get_cache_invalidating_env_vars, ir
+from .._C.libtriton import get_cache_invalidating_env_vars, ir, distributed
 from ..backends import backends
 from ..backends.compiler import Language
 from ..backends.compiler import BaseBackend, GPUTarget
@@ -93,6 +93,7 @@ class IRSource:
         self.language = Language.TRITON
         self.src = path.read_text()
         ir.load_dialects(context)
+        distributed.ir.load_dialects(context)
         backend.load_dialects(context)
 
         # We don't have a easy-to-use PTX parser that we can use, so keep that regex for now.
@@ -292,6 +293,7 @@ def compile(src, target=None, options=None, _env_vars=None):
     if not isinstance(src, IRSource):
         context = ir.context()
         ir.load_dialects(context)
+        distributed.ir.load_dialects(context)
         backend.load_dialects(context)
 
     codegen_fns = backend.get_codegen_implementation(options)
