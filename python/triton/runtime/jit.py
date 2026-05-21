@@ -17,6 +17,8 @@ from types import ModuleType
 from .. import knobs
 from .driver import driver
 from . import _async_compile
+from .host_trace import trace_scope as _ht_scope
+from . import _fastpath as _fp
 from .._utils import find_paths_if, get_iterable_path, type_canonicalisation_dict, canonicalize_dtype
 from .cache import get_cache_key
 from triton._C.libtriton import get_cache_invalidating_env_vars
@@ -432,6 +434,114 @@ def serialize_specialization_data(name, signature, constants, attrs, options, ke
     return serialized_obj
 
 
+# Per-param flag bits.  Kept in sync with ``_binder_c.c``'s PF_* defines.
+_PF_IS_CONSTEXPR              = 1 << 0
+_PF_IS_CONST                  = 1 << 1
+_PF_DO_NOT_SPECIALIZE         = 1 << 2
+_PF_DO_NOT_SPECIALIZE_ON_ALIGN = 1 << 3
+_PF_HAS_ANNOTATION            = 1 << 4
+_PF_ANNOTATION_NO_SPEC        = 1 << 5
+_PF_HAS_DEFAULT               = 1 << 6
+
+# Fast-path bits, mirroring ``_binder_c.c``'s FP_* defines.
+# Only ``FP_SPEC_EXTRA_INLINE`` is set in this build: it tells the C binder
+# that the active backend's ``get_arg_specialization`` is the unmodified
+# BaseBackend implementation, so the alignment check can be inlined in C
+# instead of crossing back to Python per-argument.
+_FP_SPEC_EXTRA_INLINE = 1 << 2
+
+
+def _spec_extra_is_base(get_arg_spec):
+    """Return True iff ``backend.get_arg_specialization`` is identical to
+    ``BaseBackend.get_arg_specialization`` (the NVIDIA / default
+    implementation).  In that case the C binder can inline the alignment
+    check and skip the Python callback entirely."""
+    try:
+        from ..backends.compiler import BaseBackend
+    except Exception:
+        return False
+    base_fn = BaseBackend.get_arg_specialization
+    # ``get_arg_specialization`` is a @staticmethod -- compare the unwrapped
+    # function objects.  ``base_fn`` is the function itself once the
+    # staticmethod descriptor is fetched off the class.
+    try:
+        # Both are typically the same callable object when nothing
+        # subclasses BaseBackend.get_arg_specialization.
+        return get_arg_spec is base_fn or getattr(get_arg_spec, "__func__", None) is base_fn
+    except Exception:
+        return False
+
+
+def _build_c_binder(sig, kparams, backend):
+    """Construct a ``_binder_c.BinderState`` equivalent to the exec'd
+    ``dynamic_func`` for this kernel.  Returns the state object, which is
+    callable with the same protocol as ``dynamic_func``."""
+    from . import _binder_c  # type: ignore
+
+    assert len(sig.parameters) == len(kparams)
+    names = []
+    flags = []
+    annotations = []
+    defaults = []
+    sig_params = list(sig.parameters.values())
+    for kp, sp in zip(kparams, sig_params):
+        names.append(kp.name)
+
+        f = 0
+        if kp.is_constexpr:
+            f |= _PF_IS_CONSTEXPR
+        if kp.is_const:
+            f |= _PF_IS_CONST
+        if kp.do_not_specialize:
+            f |= _PF_DO_NOT_SPECIALIZE
+        if kp.do_not_specialize_on_alignment:
+            f |= _PF_DO_NOT_SPECIALIZE_ON_ALIGN
+
+        ann = kp.annotation_type
+        if ann:
+            # Match the legacy logic exactly: only treat ann as a string
+            # spec when it is a plain ``str``; otherwise we let the Python
+            # fallback path handle it.
+            if not isinstance(ann, str):
+                # Punt to Python -- the C state cannot describe non-str
+                # annotation_type.  The state object cannot represent this
+                # so we abort here and let the caller fall back.
+                raise NotImplementedError(
+                    f"non-str annotation_type {ann!r} not supported by C binder")
+            f |= _PF_HAS_ANNOTATION
+            if ann == "u1" or ann[:2] in ("fp", "bf"):
+                f |= _PF_ANNOTATION_NO_SPEC
+
+        if sp.default is not inspect.Parameter.empty:
+            f |= _PF_HAS_DEFAULT
+            defaults.append(sp.default)
+        else:
+            defaults.append(None)
+
+        flags.append(f)
+        annotations.append(ann if isinstance(ann, str) else None)
+
+    # Tell the C binder whether to inline the alignment check.  This is the
+    # only fast-path flag in this build; all other behaviour is governed by
+    # the per-parameter bitfield computed above.
+    fast_flags = 0
+    if _spec_extra_is_base(backend.get_arg_specialization):
+        fast_flags |= _FP_SPEC_EXTRA_INLINE
+
+    specialize_impl = create_specialize_impl(backend.get_arg_specialization)
+
+    return _binder_c.BinderState(
+        param_names=tuple(names),
+        param_flags=tuple(flags),
+        annotations=tuple(annotations),
+        defaults=tuple(defaults),
+        specialize_impl=specialize_impl,
+        specialize_extra=backend.get_arg_specialization,
+        dtype2str=dtype2str,
+        fast_flags=fast_flags,
+    )
+
+
 def create_function_from_signature(sig, kparams, backend):
     """
     Equivalent to sig.bind followed by apply_defaults. This generates a
@@ -440,6 +550,24 @@ def create_function_from_signature(sig, kparams, backend):
     much of the kernel launch overhead -- every time we run the kernel.
     """
     assert len(sig.parameters) == len(kparams)
+
+    # Fast path: when the C ``_binder_c.BinderState`` extension is available
+    # and not disabled, build a per-kernel state object whose ``__call__``
+    # implements ``dynamic_func`` in C.  This shaves ~22 us of Python time
+    # off every launch and shrinks the GIL-vulnerable window during launch
+    if _fp.USE_C_BINDER:
+        try:
+            return _build_c_binder(sig, kparams, backend)
+        except Exception as exc:  # pragma: no cover - corruption guard
+            # Refuse to silently fall through if the C path is requested but
+            # construction failed -- we want loud failures during development.
+            import warnings as _warnings
+            _warnings.warn(
+                f"Triton: _binder_c.BinderState construction failed ({exc!r}); "
+                "falling back to the legacy exec'd dynamic_func.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
     # Create the function argument list and the dict entries for the return statement
     specialization = []
     # signature
@@ -706,7 +834,170 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         return options, signature, constexprs, attrs
 
-    def run(self, *args, grid, warmup, **kwargs):
+    # ------------------------------------------------------------------
+    # Two ``run`` implementations live below.
+    #
+    # * ``_run_traced``  : the canonical implementation with host-trace
+    #                       scopes around each phase. Used when
+    #                       ``TRITON_HOST_TRACE=1``.
+    # * ``_run_fast``    : a structurally identical copy without the trace
+    #                       scopes. Used when tracing is disabled (the
+    #                       default).
+    #
+    # We split them so that the disabled-tracing fast path pays *zero* cost
+    # for the ~14 ``with _ht_scope(...)`` blocks that would otherwise add
+    # ~1.5 μs / launch even when the tracer is off. Both implementations
+    # must stay in lockstep.
+    # ------------------------------------------------------------------
+
+    def _run_traced(self, *args, grid, warmup, **kwargs):
+        with _ht_scope("JITFunction.run"):
+            kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
+
+            # ``driver.active`` is a ``LazyProxy``; resolving attributes on it
+            # goes through ``__getattr__`` every time, which costs ~0.5 μs.
+            # We bind the concrete driver instance once per JITFunction in
+            # ``__init__`` and reuse it here.
+            _drv = self._fast_driver
+            with _ht_scope("run/get_device"):
+                device = _drv.get_current_device()
+            with _ht_scope("run/get_stream"):
+                stream = _drv.get_current_stream(device)
+
+            # Execute pre run hooks with args and kwargs
+            with _ht_scope("run/pre_run_hooks"):
+                for hook in self.pre_run_hooks:
+                    hook(*args, **kwargs)
+
+            with _ht_scope("run/device_caches_lookup"):
+                kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
+            # specialization is list[tuple[str, Any]], where first element of tuple is
+            # the type and the second parameter is the 'specialization' value.
+            with _ht_scope("run/bind_args"):
+                bound_args, specialization, options = binder(*args, **kwargs)
+
+            # ``compute_cache_key`` (added upstream in v3.5.1) memoises a
+            # tuple-keyed lookup that returns the legacy string form -- so
+            # the in-memory key is still bit-identical to what
+            # ``JITFunction.preload`` writes, but the hot path doesn't pay
+            # for ``str(specialization)`` on every launch.
+            with _ht_scope("run/build_key"):
+                key = compute_cache_key(kernel_key_cache, specialization, options)
+            with _ht_scope("run/kernel_cache_get"):
+                kernel = kernel_cache.get(key, None)
+
+            # Kernel is not cached; we have to compile.
+            if kernel is None:
+                with _ht_scope("run/compile_path"):
+                    with _ht_scope("run/pack_args"):
+                        options, signature, constexprs, attrs = self._pack_args(
+                            backend, kwargs, bound_args, specialization, options)
+                    with _ht_scope("run/do_compile"):
+                        kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+                    if kernel is None:
+                        return None
+
+            # Check that used global values have not changed.
+            with _ht_scope("run/globals_check"):
+                not_present = object()
+                for (name, _), (val, globals_dict) in self.used_global_vals.items():
+                    if (newVal := globals_dict.get(name, not_present)) != val:
+                        raise RuntimeError(
+                            f"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}"
+                        )
+
+            if not warmup:
+                # canonicalize grid
+                with _ht_scope("run/grid_canonicalize"):
+                    assert grid is not None
+                    if callable(grid):
+                        grid = grid(bound_args)
+                    grid_size = len(grid)
+                    grid_0 = grid[0]
+                    grid_1 = grid[1] if grid_size > 1 else 1
+                    grid_2 = grid[2] if grid_size > 2 else 1
+                # The compile path may return a future when async-compile is
+                # active; resolve it here before launching.
+                if hasattr(kernel, "result"):
+                    with _ht_scope("run/await_async_compile"):
+                        kernel = kernel.result()
+                # Skip the ``launch_metadata`` call entirely when no hook is
+                # registered; ``CompiledKernel.launch_metadata`` returns None
+                # in that case but the call + bound_args unpacking is ~3 μs.
+                enter_hook = knobs.runtime.launch_enter_hook
+                exit_hook = knobs.runtime.launch_exit_hook
+                if _fp.SKIP_LAUNCH_METADATA_WHEN_NO_HOOK and enter_hook is None and exit_hook is None:
+                    launch_metadata = None
+                else:
+                    with _ht_scope("run/launch_metadata"):
+                        launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                with _ht_scope("run/kernel_run"):
+                    kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
+                               enter_hook, exit_hook, *bound_args.values())
+            return kernel
+
+    def _run_fast(self, *args, grid, warmup, **kwargs):
+        """Tracer-free copy of ``_run_traced`` -- keep these two in sync."""
+        kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
+
+        _drv = self._fast_driver
+        device = _drv.get_current_device()
+        stream = _drv.get_current_stream(device)
+
+        for hook in self.pre_run_hooks:
+            hook(*args, **kwargs)
+
+        kernel_cache, kernel_key_cache, target, backend, binder = self.device_caches[device]
+        bound_args, specialization, options = binder(*args, **kwargs)
+
+        key = compute_cache_key(kernel_key_cache, specialization, options)
+        kernel = kernel_cache.get(key, None)
+
+        if kernel is None:
+            options, signature, constexprs, attrs = self._pack_args(
+                backend, kwargs, bound_args, specialization, options)
+            kernel = self._do_compile(key, signature, device, constexprs, options, attrs, warmup)
+            if kernel is None:
+                return None
+
+        not_present = object()
+        for (name, _), (val, globals_dict) in self.used_global_vals.items():
+            if (newVal := globals_dict.get(name, not_present)) != val:
+                raise RuntimeError(
+                    f"Global variable {name} has changed since we compiled this kernel, from {val} to {newVal}")
+
+        if not warmup:
+            assert grid is not None
+            if callable(grid):
+                grid = grid(bound_args)
+            grid_size = len(grid)
+            grid_0 = grid[0]
+            grid_1 = grid[1] if grid_size > 1 else 1
+            grid_2 = grid[2] if grid_size > 2 else 1
+            if hasattr(kernel, "result"):
+                kernel = kernel.result()
+            enter_hook = knobs.runtime.launch_enter_hook
+            exit_hook = knobs.runtime.launch_exit_hook
+            if _fp.SKIP_LAUNCH_METADATA_WHEN_NO_HOOK and enter_hook is None and exit_hook is None:
+                launch_metadata = None
+            else:
+                launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+            kernel.run(grid_0, grid_1, grid_2, stream, kernel.function, kernel.packed_metadata, launch_metadata,
+                       enter_hook, exit_hook, *bound_args.values())
+        return kernel
+
+    # ------------------------------------------------------------------
+    # ``_run_upstream``: a verbatim copy of upstream Triton's ``run()``
+    # method, byte-for-byte. This is the entry point used when the user
+    # sets ``TRITON_HOST_OPT=0`` -- in that mode none of the Track A or
+    # Track B optimisations are active, host_trace is ignored, and the
+    # runtime behaves exactly as an un-patched upstream Triton would.
+    #
+    # *Do not modify this method.* It exists precisely so the user can
+    # always bisect any behavioural anomaly between "with my optimisations"
+    # and "without them" by toggling a single env var.
+    # ------------------------------------------------------------------
+    def _run_upstream(self, *args, grid, warmup, **kwargs):
         kwargs["debug"] = kwargs.get("debug", self.debug) or knobs.runtime.debug
 
         # parse options
@@ -758,6 +1049,42 @@ class JITFunction(JITCallable, KernelInterface[T]):
                        knobs.runtime.launch_enter_hook, knobs.runtime.launch_exit_hook, *bound_args.values())
         return kernel
 
+    # ------------------------------------------------------------------
+    # Class-load-time dispatch.
+    # ------------------------------------------------------------------
+    #
+    # The user controls which implementation backs ``JITFunction.run``
+    # via two env vars, resolved exactly once at module import time so
+    # the hot path has zero per-launch conditional cost:
+    #
+    #   TRITON_HOST_OPT   default 1
+    #       0 / false / no / off  -> ``_run_upstream``  (verbatim
+    #                                upstream behaviour, no Track A/B,
+    #                                no tracing, no env hints).
+    #       any other value       -> optimised path (Track A always on,
+    #                                Track B per-flag, instrumentation
+    #                                inserted if TRITON_HOST_TRACE=1).
+    #
+    #   TRITON_HOST_TRACE default 0
+    #       Only consulted when ``TRITON_HOST_OPT`` is on. ``1`` selects
+    #       ``_run_traced`` (the instrumented copy) so users can collect
+    #       Perfetto traces. ``0`` selects ``_run_fast`` (no scope
+    #       overhead).
+    #
+    # In every mode the on-disk artefact, the cache hit semantics, the
+    # ``_call_hook`` contract, and the numerical output of every kernel
+    # are identical -- the optimisations only change *Python-side*
+    # bookkeeping. See ``docs/host-overhead/30-optimizations.md`` for
+    # the safety analysis of each individual optimisation.
+    from . import host_trace as _ht_mod
+    if not _fp.HOST_OPT_ENABLED:
+        run = _run_upstream
+    elif _ht_mod.is_enabled():
+        run = _run_traced
+    else:
+        run = _run_fast
+    del _ht_mod
+
     def repr(self, _):
         return self._fn_name if self._repr is None else self._repr(_)
 
@@ -782,6 +1109,14 @@ class JITFunction(JITCallable, KernelInterface[T]):
 
         # cache of just-in-time compiled kernels
         self.device_caches = defaultdict(self.create_binder)
+        # Cache the concrete driver instance to bypass LazyProxy.__getattr__
+        # in the launch hot path (saves ~0.5 μs / launch). It is the user's
+        # responsibility to refresh this if they call ``driver.set_active``.
+        # Note: ``self.hash`` and ``self.used_global_vals`` are now initialised
+        # by ``JITCallable.__init__`` (v3.5.1 split a parent class out), so we
+        # only add the new ``_fast_driver`` field here.
+        self._fast_driver = driver.active._initialize_obj() if hasattr(driver.active,
+                                                                       "_initialize_obj") else driver.active
 
         # JITFunction can be instantiated as kernel
         # when called with a grid using __getitem__

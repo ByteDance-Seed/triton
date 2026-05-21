@@ -9,6 +9,7 @@ from .. import __version__, knobs
 from ..runtime.autotuner import OutOfResources
 from ..runtime.cache import get_cache_manager, get_dump_manager, get_override_manager, get_cache_key
 from ..runtime.driver import driver
+from ..runtime.host_trace import trace_scope as _ht_scope
 from ..tools.disasm import get_sass
 from pathlib import Path
 import re
@@ -221,6 +222,7 @@ class CompileTimer:
 
 
 def compile(src, target=None, options=None, _env_vars=None):
+  with _ht_scope("compile"):
     compilation_listener = knobs.compilation.listener
     if compilation_listener:
         timer = CompileTimer()
@@ -239,10 +241,17 @@ def compile(src, target=None, options=None, _env_vars=None):
     extra_options = src.parse_options()
     options = backend.parse_options(dict(options or dict(), **extra_options))
     # create cache manager
-    env_vars = get_cache_invalidating_env_vars() if _env_vars is None else _env_vars
-    key = get_cache_key(src, backend, options, env_vars=env_vars)
-    hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    fn_cache_manager = get_cache_manager(hash)
+    with _ht_scope("compile/env_vars"):
+        env_vars = get_cache_invalidating_env_vars() if _env_vars is None else _env_vars
+    with _ht_scope("compile/build_compile_key"):
+        # v3.5.1 collapsed triton_key/src.hash/backend.hash/options.hash into
+        # ``get_cache_key``; we can no longer drop scopes around the individual
+        # sub-hashes without breaking the cache identity (their combination is
+        # what ``get_cache_key`` agrees on).  Track the whole call instead.
+        key = get_cache_key(src, backend, options, env_vars=env_vars)
+        hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    with _ht_scope("compile/get_cache_manager"):
+        fn_cache_manager = get_cache_manager(hash)
     # For dumping/overriding only hash the source as we want it to be independent of triton
     # core changes to make it easier to track kernels by hash.
     enable_override = knobs.compilation.override
@@ -256,12 +265,14 @@ def compile(src, target=None, options=None, _env_vars=None):
     # the file name to 150 characters to be safe.
     file_name = src.name[:150]
     metadata_filename = f"{file_name}.json"
-    metadata_group = fn_cache_manager.get_group(metadata_filename) or {}
-    metadata_path = metadata_group.get(metadata_filename)
+    with _ht_scope("compile/cache_lookup"):
+        metadata_group = fn_cache_manager.get_group(metadata_filename) or {}
+        metadata_path = metadata_group.get(metadata_filename)
     always_compile = knobs.compilation.always_compile
     if not always_compile and metadata_path is not None:
         # cache hit!
-        res = CompiledKernel(src, metadata_group, hash)
+        with _ht_scope("compile/load_cached_kernel"):
+            res = CompiledKernel(src, metadata_group, hash)
         if compilation_listener:
             compilation_listener(
                 src=src,
@@ -291,18 +302,20 @@ def compile(src, target=None, options=None, _env_vars=None):
     # For IRSource, we have already grabbed the context + called both
     # ir.load_dialects and backend.load_dialects.
     if not isinstance(src, IRSource):
-        context = ir.context()
-        ir.load_dialects(context)
-        distributed.ir.load_dialects(context)
-        backend.load_dialects(context)
+        with _ht_scope("compile/init_context"):
+            context = ir.context()
+            ir.load_dialects(context)
+            distributed.ir.load_dialects(context)
+            backend.load_dialects(context)
 
     codegen_fns = backend.get_codegen_implementation(options)
     module_map = backend.get_module_map()
-    try:
-        module = src.make_ir(target, options, codegen_fns, module_map, context)
-    except Exception as e:
-        filter_traceback(e)
-        raise
+    with _ht_scope("compile/make_ir"):
+        try:
+            module = src.make_ir(target, options, codegen_fns, module_map, context)
+        except Exception as e:
+            filter_traceback(e)
+            raise
 
     if ir_source:
         ir_filename = f"{file_name}.{src.ext}"
@@ -319,7 +332,8 @@ def compile(src, target=None, options=None, _env_vars=None):
     if compilation_listener:
         timer.finished_ir_initialization()
     for ext, compile_ir in list(stages.items())[first_stage:]:
-        next_module = compile_ir(module, metadata)
+        with _ht_scope(f"compile/stage[{ext}]"):
+            next_module = compile_ir(module, metadata)
         ir_filename = f"{file_name}.{ext}"
         if fn_override_manager is None:
             # Users can override kernels at scale by setting `ir_override` in autotune config
@@ -457,28 +471,33 @@ class CompiledKernel:
             self._run = functools.partial(_raise_error, cloned_err)
             raise err
 
-        device = driver.active.get_current_device()
-        # create launcher
-        self._run = driver.active.launcher_cls(self.src, self.metadata)
-        # not enough shared memory to run the kernel
-        max_shared = max_shared_mem(device)
-        if self.metadata.shared > max_shared:
-            raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
-        if hasattr(self.metadata, "tmem_size") and self.metadata.tmem_size is not None:
-            # Use blackwell max tmem size for now, this should be moved in device properties
-            max_tmem_size = 512  # tmem size in number of columns
-            if self.metadata.tmem_size > max_tmem_size:
-                raise_(OutOfResources(self.metadata.tmem_size, max_tmem_size, "tensor memory"))
-        if knobs.runtime.kernel_load_start_hook is not None:
-            knobs.runtime.kernel_load_start_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
-        # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
-        self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = driver.active.utils.load_binary(
-            self.name, self.kernel, self.metadata.shared, device)
-        warp_size = driver.active.get_current_target().warp_size
-        if self.metadata.num_warps * warp_size > self.n_max_threads:
-            raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))
-        if knobs.runtime.kernel_load_end_hook is not None:
-            knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group, self.hash)
+        with _ht_scope("CompiledKernel._init_handles"):
+            device = driver.active.get_current_device()
+            # create launcher
+            with _ht_scope("init_handles/build_launcher"):
+                self._run = driver.active.launcher_cls(self.src, self.metadata)
+            # not enough shared memory to run the kernel
+            max_shared = max_shared_mem(device)
+            if self.metadata.shared > max_shared:
+                raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+            if hasattr(self.metadata, "tmem_size") and self.metadata.tmem_size is not None:
+                # Use blackwell max tmem size for now, this should be moved in device properties
+                max_tmem_size = 512  # tmem size in number of columns
+                if self.metadata.tmem_size > max_tmem_size:
+                    raise_(OutOfResources(self.metadata.tmem_size, max_tmem_size, "tensor memory"))
+            if knobs.runtime.kernel_load_start_hook is not None:
+                knobs.runtime.kernel_load_start_hook(self.module, self.function, self.name, self.metadata_group,
+                                                     self.hash)
+            # TODO: n_regs, n_spills should be metadata generated when calling `ptxas`
+            with _ht_scope("init_handles/load_binary"):
+                self.module, self.function, self.n_regs, self.n_spills, self.n_max_threads = driver.active.utils.load_binary(
+                    self.name, self.kernel, self.metadata.shared, device)
+            warp_size = driver.active.get_current_target().warp_size
+            if self.metadata.num_warps * warp_size > self.n_max_threads:
+                raise_(OutOfResources(self.metadata.num_warps * warp_size, self.n_max_threads, "threads"))
+            if knobs.runtime.kernel_load_end_hook is not None:
+                knobs.runtime.kernel_load_end_hook(self.module, self.function, self.name, self.metadata_group,
+                                                   self.hash)
 
     @property
     def run(self):
