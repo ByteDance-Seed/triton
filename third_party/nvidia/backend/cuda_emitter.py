@@ -1017,8 +1017,8 @@ class CUDACodeGen:
             if inner:
                 return mlir_type_to_cuda(inner.group(1)) + '*'
         if type_str.startswith('!tt.tensordesc<'):
-            # TMA tensor descriptor — opaque pointer (CUtensorMap*)
-            return 'const void*'
+            # TMA tensor descriptor — 128-byte CUtensorMap, passed as __grid_constant__
+            return 'const __grid_constant__ CUtensorMap'
         return mlir_type_to_cuda(type_str)
 
     def _get_scalar_type(self, type_str: str) -> str:
@@ -2789,7 +2789,7 @@ class CUDACodeGen:
         self._emit(f'asm volatile(')
         self._emit(f'    "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {{%2, %3}}], [%4];\\n"')
         self._emit(f'    :: "r"((unsigned)__cvta_generic_to_shared({smem_var})),')
-        self._emit(f'       "l"((uint64_t)(uintptr_t){desc_var}),')
+        self._emit(f'       "l"((uint64_t)&{desc_var}),')
         self._emit(f'       "r"({coord1}), "r"({coord0}),')
         self._emit(f'       "r"((unsigned)__cvta_generic_to_shared({bar_var}))')
         self._emit(f');')
@@ -2818,7 +2818,7 @@ class CUDACodeGen:
         self.indent_level += 1
         self._emit(f'asm volatile(')
         self._emit(f'    "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group [%0, {{%1, %2}}], [%3];\\n"')
-        self._emit(f'    :: "l"((uint64_t)(uintptr_t){desc_var}),')
+        self._emit(f'    :: "l"((uint64_t)&{desc_var}),')
         self._emit(f'       "r"({coord1}), "r"({coord0}),')
         self._emit(f'       "r"((unsigned)__cvta_generic_to_shared({smem_var}))')
         self._emit(f');')
