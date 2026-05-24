@@ -350,9 +350,54 @@ KERNELS["04-low-memory-dropout"] = textwrap.dedent("""\
 # Note: Full fused attention uses tensor descriptors which need more emitter work
 # We test a simplified version here
 
-# ---------- 08-11: Advanced tutorials (compile test only) ----------
-# These use features like TMA, warp specialization, dot_scaled, PDL
-# which need additional emitter support. We test that they at least compile.
+# ---------- 06 fused-attention ----------
+# Uses tensor descriptors (TMA) - requires additional emitter support
+# Skipped for now
+
+# ---------- 08 grouped-gemm ----------
+# Uses indirect dispatch + matmul - requires TMA and complex indexing
+# Skipped for now
+
+# ---------- 09 persistent-matmul ----------
+# Uses persistent kernel pattern + TMA
+# Skipped for now
+
+# ---------- 10 block-scaled-matmul ----------
+# Uses dot_scaled + FP4/FP8 - Blackwell (sm_100+) only
+# Skipped for now
+
+# ---------- 11 programmatic-dependent-launch ----------
+# Test with USE_GDC=False (no PDL, just vector-add)
+KERNELS["11-programmatic-dependent-launch"] = textwrap.dedent("""\
+    @triton.jit
+    def pdl_add_kernel(x_ptr, y_ptr, output_ptr, n_elements,
+                       BLOCK_SIZE: tl.constexpr, USE_GDC: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        x = tl.load(x_ptr + offsets, mask=mask)
+        y = tl.load(y_ptr + offsets, mask=mask)
+        output = x + y
+        tl.store(output_ptr + offsets, output, mask=mask)
+
+    torch.manual_seed(42); N=98432
+    x_pdl=torch.rand(N,device=DEVICE); y_pdl=torch.rand(N,device=DEVICE)
+    grid=lambda meta:(triton.cdiv(N,meta['BLOCK_SIZE']),)
+    out_cuda=torch.empty_like(x_pdl)
+    try:
+        pdl_add_kernel[grid](x_pdl,y_pdl,out_cuda,N,BLOCK_SIZE=1024,USE_GDC=False,emit_cuda=True)
+        torch.cuda.synchronize()
+        pdl_add_kernel.device_caches.clear()
+        shutil.rmtree(os.path.expanduser('~/.triton/cache'), ignore_errors=True)
+        out_ref=torch.empty_like(x_pdl)
+        pdl_add_kernel[grid](x_pdl,y_pdl,out_ref,N,BLOCK_SIZE=1024,USE_GDC=False)
+        torch.cuda.synchronize()
+        match=torch.equal(out_ref,out_cuda)
+        print("RESULT:"+json.dumps({"name":"11-programmatic-dependent-launch","compile":True,"bitwise":match}))
+    except Exception as e:
+        print("RESULT:"+json.dumps({"name":"11-programmatic-dependent-launch","compile":False,"error":str(e)[:300]}))
+""")
 
 
 if __name__ == "__main__":
