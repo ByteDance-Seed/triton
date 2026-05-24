@@ -1016,6 +1016,9 @@ class CUDACodeGen:
             inner = re.search(r'!tt\.ptr<(.+?)(?:,\s*\d+)?\s*>', type_str)
             if inner:
                 return mlir_type_to_cuda(inner.group(1)) + '*'
+        if type_str.startswith('!tt.tensordesc<'):
+            # TMA tensor descriptor — opaque pointer (CUtensorMap*)
+            return 'const void*'
         return mlir_type_to_cuda(type_str)
 
     def _get_scalar_type(self, type_str: str) -> str:
@@ -1089,6 +1092,10 @@ class CUDACodeGen:
             self._emit_local_store(op)
         elif name == 'ttg.local_load':
             self._emit_local_load(op)
+        elif name in ('ttg.memdesc_subview', 'ttg.memdesc_index'):
+            self._emit_memdesc_subview(op)
+        elif name == 'ttg.local_dealloc':
+            self._emit(f'// local_dealloc (no-op in CUDA)')
         elif name == 'gpu.barrier':
             self._emit('__syncthreads();')
         # NVGPUIR ops (sm90a features)
@@ -1112,8 +1119,10 @@ class CUDACodeGen:
             self._emit_tma_copy_g2l(op)
         elif name == 'ttng.async_tma_copy_local_to_global':
             self._emit_tma_copy_l2g(op)
-        elif name == 'ttng.tma_store_wait':
-            self._emit('asm volatile("cp.async.bulk.wait_group 0;");')
+        elif name in ('ttng.tma_store_wait', 'ttng.async_tma_store_wait'):
+            pendings = re.search(r'pendings\s*=\s*(\d+)', op.raw_text)
+            n = pendings.group(1) if pendings else '0'
+            self._emit(f'asm volatile("cp.async.bulk.wait_group {n};");')
         elif name == 'ttng.async_copy_mbarrier_arrive':
             self._emit('// async_copy_mbarrier_arrive (handled by TMA)')
         elif name == 'tt.mulhiui':
@@ -2170,6 +2179,56 @@ class CUDACodeGen:
             self._register_var(result.name, var, src_type)
             self._emit(f'auto {var} = {src_var}; // convert_layout (scalar)')
 
+    def _emit_memdesc_subview(self, op: IROperation):
+        """Emit memdesc_index/memdesc_subview: index into a multi-buffered shared memory allocation.
+
+        TTGIR: %sub = ttg.memdesc_index %base[%idx] : memdesc<3xMxNxT> -> memdesc<MxNxT>
+        CUDA: T* sub = base + idx * (M * N);
+        """
+        if not op.results or not op.operands:
+            return
+        result = op.results[0]
+        base_var = self._get_var(op.operands[0])
+        base_type = self._get_elem_type(op.operands[0])
+
+        # Extract index from brackets [%idx]
+        idx_match = re.search(r'\[(%[\w.\-]+(?:[:#]\d+)?)\]', op.raw_text)
+        idx_var = self._get_var(idx_match.group(1)) if idx_match else '0'
+
+        # Extract result memdesc shape to compute stride
+        # e.g., memdesc<3x128x32xf16> → subview is 128x32xf16, stride = 128*32
+        # Result type: memdesc<128x32xf16, ...> or memdesc<1xi64, ...>
+        result_m = re.search(r'->\s*!ttg\.memdesc<([^>]+)>', op.raw_text)
+        stride = 1
+        elem_type = base_type
+        if result_m:
+            inner = result_m.group(1)
+            dims = []
+            remaining = inner
+            while remaining:
+                dm = re.match(r'(\d+)x(.*)', remaining)
+                if dm:
+                    dims.append(int(dm.group(1)))
+                    remaining = dm.group(2)
+                else:
+                    t = remaining.split(',')[0].strip()
+                    if t in MLIR_TO_CUDA_TYPE:
+                        elem_type = t
+                    break
+            for d in dims:
+                stride *= d
+
+        cuda_type = mlir_type_to_cuda(elem_type)
+        type_size = {'float': 4, '__half': 2, '__nv_bfloat16': 2, 'double': 8,
+                     'int': 4, 'int64_t': 8, 'int8_t': 1, 'int16_t': 2, 'uint64_t': 8}
+        elem_bytes = type_size.get(cuda_type, 4)
+
+        var = self._new_var('sv')
+        self._register_var(result.name, var, elem_type)
+        # Compute byte offset: idx * stride * sizeof(element)
+        byte_stride = stride * elem_bytes
+        self._emit(f'{cuda_type}* {var} = ({cuda_type}*)((char*){base_var} + {idx_var} * {byte_stride});')
+
     def _emit_local_alloc(self, op: IROperation):
         if not op.results:
             return
@@ -2503,8 +2562,8 @@ class CUDACodeGen:
 
         # Compute shared memory descriptors for A and B
         self._emit(f'// Construct WGMMA shared memory descriptors')
-        self._emit(f'uint32_t smem_addr_a = __cvta_generic_to_shared({a_var});')
-        self._emit(f'uint32_t smem_addr_b = __cvta_generic_to_shared({b_var});')
+        self._emit(f'uint32_t smem_addr_a = (unsigned)__cvta_generic_to_shared({a_var});')
+        self._emit(f'uint32_t smem_addr_b = (unsigned)__cvta_generic_to_shared({b_var});')
         self._emit_blank()
 
         # Emit wgmma.fence
@@ -2650,22 +2709,24 @@ class CUDACodeGen:
 
     def _emit_init_barrier(self, op: IROperation):
         """Emit mbarrier init."""
-        if op.operands:
-            bar_var = self._get_var(op.operands[0])
-            count = 1
-            count_m = re.search(r'count\s*=\s*(\d+)', op.raw_text)
-            if count_m:
-                count = int(count_m.group(1))
-            self._emit(f'asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"(__cvta_generic_to_shared({bar_var})), "r"({count}));')
+        # Extract barrier operand from operands list or raw text
+        bar_ops = op.operands or re.findall(r'%[\w.\-]+', op.raw_text.split(':')[0] if ':' in op.raw_text else op.raw_text)
+        if bar_ops:
+            bar_var = self._get_var(bar_ops[0])
+            # Extract count from raw text (the integer after the comma)
+            count_m = re.search(r',\s*(\d+)', op.raw_text)
+            count = int(count_m.group(1)) if count_m else 1
+            self._emit(f'asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared({bar_var})), "r"({count}));')
 
     def _emit_wait_barrier(self, op: IROperation):
         """Emit mbarrier wait."""
-        if op.operands:
-            bar_var = self._get_var(op.operands[0])
-            phase = self._get_var(op.operands[1]) if len(op.operands) > 1 else '0'
+        bar_ops = op.operands or re.findall(r'%[\w.\-]+', op.raw_text.split(':')[0] if ':' in op.raw_text else op.raw_text)
+        if bar_ops:
+            bar_var = self._get_var(bar_ops[0])
+            phase = self._get_var(bar_ops[1]) if len(bar_ops) > 1 else '0'
             self._emit(f'{{')
             self.indent_level += 1
-            self._emit(f'uint32_t bar_addr = __cvta_generic_to_shared({bar_var});')
+            self._emit(f'uint32_t bar_addr = (unsigned)__cvta_generic_to_shared({bar_var});')
             self._emit(f'asm volatile(')
             self._emit(f'    "{{\\n"')
             self._emit(f'    ".reg .pred P1;\\n"')
@@ -2681,24 +2742,88 @@ class CUDACodeGen:
         """Emit mbarrier arrive."""
         if op.operands:
             bar_var = self._get_var(op.operands[0])
-            self._emit(f'asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"(__cvta_generic_to_shared({bar_var})));')
+            self._emit(f'asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"((unsigned)__cvta_generic_to_shared({bar_var})));')
 
     def _emit_barrier_expect(self, op: IROperation):
         """Emit mbarrier expect_tx."""
-        if len(op.operands) >= 2:
-            bar_var = self._get_var(op.operands[0])
-            count_var = self._get_var(op.operands[1])
-            self._emit(f'asm volatile("mbarrier.expect_tx.shared::cta.b64 [%0], %1;" :: "r"(__cvta_generic_to_shared({bar_var})), "r"({count_var}));')
+        bar_ops = op.operands or re.findall(r'%[\w.\-]+', op.raw_text.split(':')[0] if ':' in op.raw_text else op.raw_text)
+        if len(bar_ops) >= 2:
+            bar_var = self._get_var(bar_ops[0])
+            # Extract byte count - could be a constant like "16384" or a variable
+            raw_after_op = op.raw_text.split(bar_ops[0].lstrip('%'), 1)[-1] if bar_ops else op.raw_text
+            count_match = re.search(r',\s*(\d+)', raw_after_op)
+            if count_match:
+                count_var = count_match.group(1)
+            else:
+                count_var = self._get_var(bar_ops[1]) if len(bar_ops) > 1 else '0'
+            self._emit(f'asm volatile("mbarrier.expect_tx.shared::cta.b64 [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared({bar_var})), "r"({count_var}));')
 
     def _emit_tma_copy_g2l(self, op: IROperation):
-        """Emit TMA global-to-shared copy using cp.async.bulk.tensor."""
-        self._emit(f'// TMA copy global→shared (TODO: full implementation)')
-        self._emit(f'// {op.raw_text.strip()}')
+        """Emit TMA global-to-shared copy: cp.async.bulk.tensor.2d PTX.
+
+        TTGIR: ttng.async_tma_copy_global_to_local %desc[%x, %y] %smem, %bar, %pred
+        """
+        raw = op.raw_text
+        operands = op.operands
+        if len(operands) < 3:
+            self._emit(f'// TMA g2l: insufficient operands')
+            return
+
+        desc_var = self._get_var(operands[0])
+
+        # Extract coordinates from [%x, %y] in raw text
+        coord_match = re.search(r'\[(%[\w.\-]+(?:[:#]\d+)?),\s*(%[\w.\-]+(?:[:#]\d+)?)\]', raw)
+        coord0 = self._get_var(coord_match.group(1)) if coord_match else '0'
+        coord1 = self._get_var(coord_match.group(2)) if coord_match else '0'
+
+        # The operands after the brackets: smem_dest, barrier, pred
+        # Parse from raw: %desc[coords] %smem, %barrier, %pred
+        after_bracket = raw.split(']', 1)[-1] if ']' in raw else raw
+        extra_ops = re.findall(r'%[\w.\-]+(?:[:#]\d+)?', after_bracket.split(':')[0] if ':' in after_bracket else after_bracket)
+        smem_var = self._get_var(extra_ops[0]) if len(extra_ops) > 0 else 'nullptr'
+        bar_var = self._get_var(extra_ops[1]) if len(extra_ops) > 1 else 'nullptr'
+
+        self._emit(f'// TMA: cp.async.bulk.tensor.2d global→shared')
+        self._emit(f'if (threadIdx.x == 0) {{')
+        self.indent_level += 1
+        self._emit(f'asm volatile(')
+        self._emit(f'    "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {{%2, %3}}], [%4];\\n"')
+        self._emit(f'    :: "r"((unsigned)__cvta_generic_to_shared({smem_var})),')
+        self._emit(f'       "l"((uint64_t)(uintptr_t){desc_var}),')
+        self._emit(f'       "r"({coord1}), "r"({coord0}),')
+        self._emit(f'       "r"((unsigned)__cvta_generic_to_shared({bar_var}))')
+        self._emit(f');')
+        self.indent_level -= 1
+        self._emit(f'}}')
 
     def _emit_tma_copy_l2g(self, op: IROperation):
-        """Emit TMA shared-to-global copy."""
-        self._emit(f'// TMA copy shared→global (TODO: full implementation)')
-        self._emit(f'// {op.raw_text.strip()}')
+        """Emit TMA shared-to-global copy: cp.async.bulk.tensor.2d PTX.
+
+        TTGIR: ttng.async_tma_copy_local_to_global %desc[%x, %y] %smem
+        """
+        raw = op.raw_text
+        operands = op.operands
+        desc_var = self._get_var(operands[0]) if operands else 'nullptr'
+
+        coord_match = re.search(r'\[(%[\w.\-]+(?:[:#]\d+)?),\s*(%[\w.\-]+(?:[:#]\d+)?)\]', raw)
+        coord0 = self._get_var(coord_match.group(1)) if coord_match else '0'
+        coord1 = self._get_var(coord_match.group(2)) if coord_match else '0'
+
+        after_bracket = raw.split(']', 1)[-1] if ']' in raw else raw
+        extra_ops = re.findall(r'%[\w.\-]+(?:[:#]\d+)?', after_bracket.split(':')[0] if ':' in after_bracket else after_bracket)
+        smem_var = self._get_var(extra_ops[0]) if extra_ops else 'nullptr'
+
+        self._emit(f'// TMA: cp.async.bulk.tensor.2d shared→global')
+        self._emit(f'if (threadIdx.x == 0) {{')
+        self.indent_level += 1
+        self._emit(f'asm volatile(')
+        self._emit(f'    "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group [%0, {{%1, %2}}], [%3];\\n"')
+        self._emit(f'    :: "l"((uint64_t)(uintptr_t){desc_var}),')
+        self._emit(f'       "r"({coord1}), "r"({coord0}),')
+        self._emit(f'       "r"((unsigned)__cvta_generic_to_shared({smem_var}))')
+        self._emit(f');')
+        self.indent_level -= 1
+        self._emit(f'}}')
 
     # -----------------------------------------------------------------------
     # Helper Methods
