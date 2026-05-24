@@ -129,6 +129,7 @@ class CUDAOptions:
     sanitize_overflow: bool = True
     arch: str = None
     instrumentation_mode: str = ""
+    emit_cuda: bool = False  # If True, emit CUDA C++ code instead of going through LLVM/PTX
 
     def __post_init__(self):
         default_libdir = Path(__file__).parent / 'lib'
@@ -512,6 +513,75 @@ please share the reproducer above with Triton project.
                 os.remove(fbin)
         return cubin
 
+    def make_cuda(self, src, metadata, options, capability):
+        """Translate TTGIR module to CUDA C++ source code."""
+        from .cuda_emitter import CUDAEmitter
+        emitter = CUDAEmitter(
+            capability=capability,
+            num_warps=options.num_warps,
+            num_ctas=options.num_ctas,
+        )
+        cuda_src = emitter.emit(src)
+        metadata["name"] = emitter.kernel_name
+        metadata["shared"] = emitter.shared_mem_size
+        # Set metadata that would normally come from LLVM lowering
+        if "tmem_size" not in metadata:
+            metadata["tmem_size"] = 0
+        if "global_scratch_size" not in metadata:
+            metadata["global_scratch_size"] = 0
+        if "global_scratch_align" not in metadata:
+            metadata["global_scratch_align"] = 0
+        return cuda_src
+
+    def make_cubin_from_cuda(self, src, metadata, options, capability):
+        """Compile CUDA source code to cubin using nvcc."""
+        arch = sm_arch_from_capability(capability)
+        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.cu') as fsrc, \
+            tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
+            fsrc.write(src)
+            fsrc.flush()
+            cubin_path = fsrc.name + '.cubin'
+
+            fmad = [] if not options.enable_fp_fusion else ['--fmad=true']
+
+            nvcc_cmd = [
+                'nvcc', '-cubin',
+                f'--gpu-architecture={arch}',
+                '-O3',
+                '--use_fast_math',
+                *fmad,
+                '-std=c++17',
+                fsrc.name,
+                '-o', cubin_path,
+            ]
+
+            try:
+                subprocess.run(nvcc_cmd, check=True, close_fds=False,
+                             stdout=flog, stderr=subprocess.STDOUT)
+                if os.path.exists(fsrc.name):
+                    os.remove(fsrc.name)
+                if os.path.exists(flog.name):
+                    os.remove(flog.name)
+            except subprocess.CalledProcessError as e:
+                with open(flog.name) as log_file:
+                    log = log_file.read()
+                # Also read the CUDA source for debugging
+                cuda_src_debug = src[:2000] if len(src) > 2000 else src
+                if os.path.exists(flog.name):
+                    os.remove(flog.name)
+                raise RuntimeError(
+                    f"`nvcc` failed with error code {e.returncode}\n"
+                    f"`nvcc` command: {' '.join(nvcc_cmd)}\n"
+                    f"`nvcc` log:\n{log}\n"
+                    f"CUDA source (first 2000 chars):\n{cuda_src_debug}\n"
+                )
+
+            with open(cubin_path, 'rb') as f:
+                cubin = f.read()
+            if os.path.exists(cubin_path):
+                os.remove(cubin_path)
+        return cubin
+
     def add_stages(self, stages, options, language):
         capability = self._parse_arch(options.arch)
         if language == Language.TRITON:
@@ -519,9 +589,15 @@ please share the reproducer above with Triton project.
             stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options, capability)
         elif language == Language.GLUON:
             stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(src, metadata, options, capability)
-        stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
-        stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.target.arch)
-        stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.target.arch)
+        if options.emit_cuda:
+            # CUDA emitter path: TTGIR -> CUDA -> cubin
+            stages["cuda"] = lambda src, metadata: self.make_cuda(src, metadata, options, capability)
+            stages["cubin"] = lambda src, metadata: self.make_cubin_from_cuda(src, metadata, options, capability)
+        else:
+            # Standard path: TTGIR -> LLVM-IR -> PTX -> cubin
+            stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
+            stages["ptx"] = lambda src, metadata: self.make_ptx(src, metadata, options, self.target.arch)
+            stages["cubin"] = lambda src, metadata: self.make_cubin(src, metadata, options, self.target.arch)
 
     @functools.lru_cache()
     def hash(self):
