@@ -1972,11 +1972,12 @@ class CUDACodeGen:
 
             # Register result variables
             # For multi-result like %accumulator:3, register %accumulator#0, #1, #2
+            # For single-result like %_mean, also register %_mean directly
             for i, (iter_name, init_name) in enumerate(iter_pairs):
                 iter_var = self._get_var(iter_name)
                 if op.results:
-                    # Multi-result: %name:N -> %name#0, %name#1, ...
                     base_name = op.results[0].name.split(':')[0]
+                    # Always register %name#i
                     result_name = f'{base_name}#{i}'
                     self.ssa_to_var[result_name] = iter_var
                     self.ssa_to_type[result_name] = self._get_elem_type(iter_name)
@@ -1985,6 +1986,15 @@ class CUDACodeGen:
                         self.ssa_tensor_info[result_name] = self.ssa_tensor_info[iter_name]
                     if self.ssa_is_ptr_tensor.get(iter_name, False):
                         self.ssa_is_ptr_tensor[result_name] = True
+                    # For single-result, also register base_name directly
+                    if len(iter_pairs) == 1 and ':' not in op.results[0].name:
+                        self.ssa_to_var[base_name] = iter_var
+                        self.ssa_to_type[base_name] = self._get_elem_type(iter_name)
+                        self.ssa_is_tensor[base_name] = self.ssa_is_tensor.get(iter_name, False)
+                        if iter_name in self.ssa_tensor_info:
+                            self.ssa_tensor_info[base_name] = self.ssa_tensor_info[iter_name]
+                        if self.ssa_is_ptr_tensor.get(iter_name, False):
+                            self.ssa_is_ptr_tensor[base_name] = True
 
         self._emit(f'for (int {iv_var} = {lb_var}; {iv_var} < {ub_var}; {iv_var} += {step_var}) {{')
         self.indent_level += 1
@@ -2258,6 +2268,25 @@ class CUDACodeGen:
         # Extract function name from attributes
         func_name = op.attributes.get('symbol', op.attributes.get('libname', 'unknown'))
         func_name = func_name.strip('"')
+        # Map libdevice __nv_ intrinsics to standard CUDA math functions
+        NV_TO_CUDA = {
+            '__nv_asinf': 'asinf', '__nv_acosf': 'acosf', '__nv_atanf': 'atanf',
+            '__nv_atan2f': 'atan2f', '__nv_sinf': 'sinf', '__nv_cosf': 'cosf',
+            '__nv_tanf': 'tanf', '__nv_sinhf': 'sinhf', '__nv_coshf': 'coshf',
+            '__nv_tanhf': 'tanhf', '__nv_expf': 'expf', '__nv_exp2f': 'exp2f',
+            '__nv_logf': 'logf', '__nv_log2f': 'log2f', '__nv_log10f': 'log10f',
+            '__nv_sqrtf': 'sqrtf', '__nv_rsqrtf': 'rsqrtf', '__nv_cbrtf': 'cbrtf',
+            '__nv_ceilf': 'ceilf', '__nv_floorf': 'floorf', '__nv_truncf': 'truncf',
+            '__nv_roundf': 'roundf', '__nv_fabsf': 'fabsf', '__nv_fmodf': 'fmodf',
+            '__nv_powf': 'powf', '__nv_fmaf': 'fmaf', '__nv_erff': 'erff',
+            '__nv_erfcf': 'erfcf', '__nv_copysignf': 'copysignf',
+            '__nv_fmaxf': 'fmaxf', '__nv_fminf': 'fminf',
+            '__nv_asin': 'asin', '__nv_acos': 'acos', '__nv_atan': 'atan',
+            '__nv_sin': 'sin', '__nv_cos': 'cos', '__nv_exp': 'exp',
+            '__nv_log': 'log', '__nv_sqrt': 'sqrt', '__nv_fabs': 'fabs',
+            '__nv_pow': 'pow', '__nv_fma': 'fma', '__nv_erf': 'erf',
+        }
+        func_name = NV_TO_CUDA.get(func_name, func_name)
 
         is_tensor = any(self.ssa_is_tensor.get(o, False) for o in op.operands)
         src_type = self._get_elem_type(op.operands[0]) if op.operands else 'f32'
