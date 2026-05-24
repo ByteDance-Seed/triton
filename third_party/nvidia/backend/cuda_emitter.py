@@ -575,13 +575,13 @@ class MLIRTextParser:
         if axis_m:
             attrs['axis'] = axis_m.group(1)
 
-        # Parse combiner region
-        body_start = full_text.find('{')
-        if body_start >= 0:
-            body_text = self._find_matching_brace(full_text, body_start)
+        # Parse combiner region — find the opening ({ not the <{ from attributes
+        # The combiner region starts with "({" and ends with "})"
+        region = IRRegion()
+        region_start = full_text.find('({')
+        if region_start >= 0:
+            body_text = self._find_matching_brace(full_text, region_start + 1)  # +1 to skip (
             region = self._parse_region(body_text, layout_aliases)
-        else:
-            region = IRRegion()
 
         op = IROperation(
             name='tt.reduce',
@@ -1178,15 +1178,19 @@ class CUDACodeGen:
             return 'true'
         if val == 'false':
             return 'false'
-        # Handle hex float literals
-        if val.startswith('0x') and type_str in ('f32', 'f16', 'bf16', 'f64'):
-            return val  # CUDA handles hex float literals
-        # Handle special float values
+        # Handle special float hex values first
         if type_str in ('f32', 'f16', 'bf16', 'f64'):
-            if 'inf' in val.lower() or val == '0x7F800000':
-                return 'INFINITY' if '-' not in val else '-INFINITY'
-            if val == '0xFF800000':
+            if val == '0xFF800000' or val == '0xff800000':
                 return '-INFINITY'
+            if val == '0x7F800000' or val == '0x7f800000':
+                return 'INFINITY'
+            if val == '0x7FC00000' or val == '0x7fc00000':
+                return 'NAN'
+            if 'inf' in val.lower():
+                return 'INFINITY' if '-' not in val else '-INFINITY'
+        # Handle generic hex float literals
+        if val.startswith('0x') and type_str in ('f32', 'f16', 'bf16', 'f64'):
+            return val
             try:
                 fval = float(val)
                 if type_str == 'f32':
@@ -1577,9 +1581,9 @@ class CUDACodeGen:
                 for cop in combiner.blocks[0].ops:
                     if 'addf' in cop.name or 'addi' in cop.name:
                         reduce_op = 'add'
-                    elif 'maxf' in cop.name or 'maximumf' in cop.name:
+                    elif 'maxnumf' in cop.name or 'maxf' in cop.name or 'maximumf' in cop.name:
                         reduce_op = 'max'
-                    elif 'minf' in cop.name or 'minimumf' in cop.name:
+                    elif 'minnumf' in cop.name or 'minf' in cop.name or 'minimumf' in cop.name:
                         reduce_op = 'min'
                     elif 'mulf' in cop.name:
                         reduce_op = 'mul'
@@ -1637,7 +1641,10 @@ class CUDACodeGen:
                     self._emit(f'    {var} = {self._get_reduce_expr(reduce_op, var, f"__shfl_xor_sync(0xffffffff, {var}, _off)", src_type)};')
                 self.indent_level -= 1
                 self._emit(f'}}')
+                self._emit(f'// Broadcast result from warp 0 to all warps')
+                self._emit(f'_warp_buf[0] = {var};')
                 self._emit(f'__syncthreads();')
+                self._emit(f'{var} = _warp_buf[0];')
                 self.indent_level -= 1
                 self._emit(f'}}')
 
@@ -1695,8 +1702,19 @@ class CUDACodeGen:
         is_tensor = any(self.ssa_is_tensor.get(o, False) for o in op.operands)
         src_type = self._get_elem_type(op.operands[0]) if op.operands else 'f32'
 
+        # For select, the result type comes from the value operands (not the condition)
+        if 'select' in name and len(op.operands) >= 3:
+            src_type = self._get_elem_type(op.operands[1])
+
         # If type annotation has tensor type, extract element type from there
-        tt_check = self._extract_tensor_type(op.type_str)
+        # For select: type annotation is "tensor<Nxi1>, tensor<Nxf32>" — use the LAST tensor type
+        type_str_for_check = op.type_str
+        if 'select' in name and ',' in op.type_str:
+            # Use the value type (last tensor in the type list)
+            parts = op.type_str.rsplit('tensor<', 1)
+            if len(parts) > 1:
+                type_str_for_check = 'tensor<' + parts[-1]
+        tt_check = self._extract_tensor_type(type_str_for_check)
         if tt_check and tt_check.element_type in MLIR_TO_CUDA_TYPE:
             src_type = tt_check.element_type
 
