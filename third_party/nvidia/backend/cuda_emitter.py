@@ -358,7 +358,7 @@ class MLIRTextParser:
             part = part.rstrip(')')
             part = part.strip()
             # Match %argN: type {attrs}
-            m = re.match(r'(%\w+)\s*:\s*(.+?)(?:\s*\{[^}]*\})?\s*$', part)
+            m = re.match(r'(%[\w-]+)\s*:\s*(.+?)(?:\s*\{[^}]*\})?\s*$', part)
             if m:
                 name = m.group(1)
                 type_str = m.group(2).strip()
@@ -405,7 +405,7 @@ class MLIRTextParser:
                 continue
             # Block argument header (^bb0(%arg: type):)
             if line.startswith('^'):
-                block_args_m = re.findall(r'(%\w+)\s*:\s*([^,)]+)', line)
+                block_args_m = re.findall(r'(%[\w-]+)\s*:\s*([^,)]+)', line)
                 for name, type_str in block_args_m:
                     block.args.append(IRValue(name=name, type_str=type_str.strip()))
                 i += 1
@@ -463,14 +463,14 @@ class MLIRTextParser:
         attrs = {}
 
         # Extract results
-        result_m = re.match(r'((?:%\w+(?:,\s*%\w+)*)\s*(?::\d+)?\s*=\s*)?scf\.for\s+(.*)', header)
+        result_m = re.match(r'((?:%[\w-]+(?:,\s*%[\w-]+)*)\s*(?::\d+)?\s*=\s*)?scf\.for\s+(.*)', header)
         if result_m and result_m.group(1):
-            result_names = re.findall(r'%\w+(?::\d+)?', result_m.group(1))
+            result_names = re.findall(r'%[\w-]+(?::\d+)?', result_m.group(1))
             for rn in result_names:
                 results.append(IRValue(name=rn, type_str=''))
 
         # Extract loop bounds: %iv = %lb to %ub step %step
-        bounds_m = re.search(r'(%\w+)\s*=\s*(%\w+(?::\d+)?|%c\w+)\s+to\s+(%\w+(?::\d+)?|%c\w+)\s+step\s+(%\w+(?::\d+)?|%c\w+)', header)
+        bounds_m = re.search(r'(%[\w-]+)\s*=\s*(%[\w-]+(?::\d+)?|%c\w+)\s+to\s+(%[\w-]+(?::\d+)?|%c\w+)\s+step\s+(%[\w-]+(?::\d+)?|%c\w+)', header)
         if bounds_m:
             attrs['iv'] = bounds_m.group(1)
             attrs['lb'] = bounds_m.group(2)
@@ -516,14 +516,14 @@ class MLIRTextParser:
         attrs = {}
 
         # Extract condition operand
-        cond_m = re.search(r'scf\.if\s+(%\w+(?::\d+)?)', header)
+        cond_m = re.search(r'scf\.if\s+(%[\w-]+(?::\d+)?)', header)
         if cond_m:
             attrs['cond'] = cond_m.group(1)
 
         # Extract results
-        result_m = re.match(r'((?:%\w+(?:,\s*%\w+)*)\s*=\s*)?scf\.if', header)
+        result_m = re.match(r'((?:%[\w-]+(?:,\s*%[\w-]+)*)\s*=\s*)?scf\.if', header)
         if result_m and result_m.group(1):
-            result_names = re.findall(r'%\w+', result_m.group(1))
+            result_names = re.findall(r'%[\w-]+', result_m.group(1))
             for rn in result_names:
                 results.append(IRValue(name=rn, type_str=''))
 
@@ -565,7 +565,7 @@ class MLIRTextParser:
         attrs = {}
 
         # Extract result
-        result_m = re.match(r'(%\w+(?::\d+)?)\s*=\s*"?tt\.reduce"?\s*\(([^)]*)\)', header)
+        result_m = re.match(r'(%[\w-]+(?::\d+)?)\s*=\s*"?tt\.reduce"?\s*\(([^)]*)\)', header)
         if result_m:
             results.append(IRValue(name=result_m.group(1), type_str=''))
             operands = [x.strip() for x in result_m.group(2).split(',') if x.strip()]
@@ -633,11 +633,11 @@ class MLIRTextParser:
         # or: op_name operands : types  (no result)
 
         # Extract results
-        result_match = re.match(r'((?:%[\w.]+(?::\d+)?(?:,\s*%[\w.]+(?::\d+)?)*)\s*=\s*)', line)
+        result_match = re.match(r'((?:%[\w.\-]+(?::\d+)?(?:,\s*%[\w.\-]+(?::\d+)?)*)\s*=\s*)', line)
         rest = line
         if result_match:
             result_text = result_match.group(1).rstrip('= ').strip()
-            result_names = re.findall(r'%[\w.]+(?::\d+)?', result_text)
+            result_names = re.findall(r'%[\w.\-]+(?::\d+)?', result_text)
             for rn in result_names:
                 results.append(IRValue(name=rn, type_str=''))
             rest = line[result_match.end():]
@@ -664,7 +664,7 @@ class MLIRTextParser:
                 last_colon_op = ci
         if last_colon_op >= 0:
             operand_text = operand_text[:last_colon_op]
-        operands = re.findall(r'%[\w.]+(?:[:#]\d+)?', operand_text)
+        operands = re.findall(r'%[\w.\-]+(?:[:#]\d+)?', operand_text)
 
         # Extract attributes
         attr_match = re.search(r'\{([^}]*)\}', rest)
@@ -1943,7 +1943,7 @@ class CUDACodeGen:
         iter_args_str = op.attributes.get('iter_args', '')
         if iter_args_str:
             # Parse iter_args(%name = %init)
-            iter_pairs = re.findall(r'(%\w+)\s*=\s*(%\w+(?::\d+)?)', iter_args_str)
+            iter_pairs = re.findall(r'(%[\w-]+)\s*=\s*(%[\w-]+(?::\d+)?)', iter_args_str)
             for (iter_name, init_name) in iter_pairs:
                 init_var = self._get_var(init_name)
                 init_type = self._get_elem_type(init_name)
@@ -2012,7 +2012,7 @@ class CUDACodeGen:
                     self._register_var(block.args[0].name, iv_var, 'i32')
                 for i, arg in enumerate(block.args[1:]):
                     if iter_args_str:
-                        iter_pairs = re.findall(r'(%\w+)\s*=\s*(%\w+(?::\d+)?)', iter_args_str)
+                        iter_pairs = re.findall(r'(%[\w-]+)\s*=\s*(%[\w-]+(?::\d+)?)', iter_args_str)
                         if i < len(iter_pairs):
                             iter_var = self._get_var(iter_pairs[i][0])
                             self.ssa_to_var[arg.name] = iter_var
@@ -2037,7 +2037,7 @@ class CUDACodeGen:
         """Handle scf.yield inside a for loop - update iter_args."""
         if not iter_args_str:
             return
-        iter_pairs = re.findall(r'(%\w+)\s*=\s*(%\w+(?::\d+)?)', iter_args_str)
+        iter_pairs = re.findall(r'(%[\w-]+)\s*=\s*(%[\w-]+(?::\d+)?)', iter_args_str)
         for i, operand in enumerate(op.operands):
             if i < len(iter_pairs):
                 iter_var = self._get_var(iter_pairs[i][0])
