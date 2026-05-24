@@ -1118,6 +1118,8 @@ class CUDACodeGen:
             self._emit('// async_copy_mbarrier_arrive (handled by TMA)')
         elif name == 'tt.mulhiui':
             self._emit_mulhiui(op)
+        elif name == 'tt.bitcast':
+            self._emit_tt_bitcast(op)
         elif name == 'tt.print':
             self._emit_print(op)
         elif name == 'tt.assert':
@@ -2322,6 +2324,48 @@ class CUDACodeGen:
             self._register_var(result.name, var, src_type)
             args = [self._get_var(o) for o in op.operands]
             self._emit(f'{cuda_type} {var} = {func_name}({", ".join(args)});')
+
+    def _emit_tt_bitcast(self, op: IROperation):
+        """Emit tt.bitcast: reinterpret bits without changing data."""
+        if not op.results or not op.operands:
+            return
+        result = op.results[0]
+        src_var = self._get_var(op.operands[0])
+        src_type = self._get_elem_type(op.operands[0])
+        is_tensor = self.ssa_is_tensor.get(op.operands[0], False)
+
+        # Extract result type from type annotation (after ->)
+        result_type = src_type
+        tt = self._extract_tensor_type(op.type_str)
+        if tt and tt.element_type in MLIR_TO_CUDA_TYPE:
+            result_type = tt.element_type
+
+        if is_tensor:
+            n_elems = self._get_num_elems(op.operands[0])
+            var = self._new_var('bc')
+            cuda_type = mlir_type_to_cuda(result_type)
+            self._register_var(result.name, var, result_type, is_tensor=True,
+                             shape=self.ssa_tensor_info.get(op.operands[0], ([],))[0],
+                             layout=self.ssa_tensor_info.get(op.operands[0], ([], None))[1])
+            if src_type == result_type:
+                # Same type bitcast — just alias
+                self._emit(f'{cuda_type}* {var} = {src_var}; // tt.bitcast (same type)')
+            else:
+                src_cuda = mlir_type_to_cuda(src_type)
+                self._emit(f'{cuda_type} {var}[{n_elems}];')
+                self._emit(f'#pragma unroll')
+                self._emit(f'for (int _i = 0; _i < {n_elems}; _i++)')
+                # Use memcpy for proper bitcast
+                self._emit(f'    {{ {src_cuda} _tmp = {src_var}[_i]; memcpy(&{var}[_i], &_tmp, sizeof(_tmp)); }}')
+        else:
+            var = self._new_var('bc')
+            self._register_var(result.name, var, result_type)
+            if src_type == result_type:
+                self._emit(f'auto {var} = {src_var}; // tt.bitcast (same type)')
+            else:
+                cuda_type = mlir_type_to_cuda(result_type)
+                src_cuda = mlir_type_to_cuda(src_type)
+                self._emit(f'{cuda_type} {var}; {{ {src_cuda} _tmp = {src_var}; memcpy(&{var}, &_tmp, sizeof(_tmp)); }}')
 
     def _emit_mulhiui(self, op: IROperation):
         """Emit unsigned 32-bit multiply high: result = (a * b) >> 32."""
