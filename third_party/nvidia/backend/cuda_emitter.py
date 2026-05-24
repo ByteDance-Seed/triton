@@ -1116,6 +1116,8 @@ class CUDACodeGen:
             self._emit('asm volatile("cp.async.bulk.wait_group 0;");')
         elif name == 'ttng.async_copy_mbarrier_arrive':
             self._emit('// async_copy_mbarrier_arrive (handled by TMA)')
+        elif name == 'tt.mulhiui':
+            self._emit_mulhiui(op)
         elif name == 'tt.print':
             self._emit_print(op)
         elif name == 'tt.assert':
@@ -1787,7 +1789,8 @@ class CUDACodeGen:
         elif op in ('divsi',):
             return f'({v(0)} / {v(1)})'
         elif op in ('divui',):
-            return f'((unsigned){v(0)} / (unsigned){v(1)})'
+            cast = '(uint64_t)' if result_type in ('i64',) else '(unsigned)'
+            return f'({cast}{v(0)} / {cast}{v(1)})'
         elif op in ('divf',):
             return f'({v(0)} / {v(1)})'
         elif op in ('remsi',):
@@ -1805,7 +1808,8 @@ class CUDACodeGen:
         elif op in ('shrsi',):
             return f'({v(0)} >> {v(1)})'
         elif op in ('shrui',):
-            return f'((unsigned){v(0)} >> {v(1)})'
+            cast = '(uint64_t)' if result_type in ('i64',) else '(unsigned)'
+            return f'({cast}{v(0)} >> {v(1)})'
         # Comparison ops - predicate is in the op name like "cmpi slt"
         elif op.startswith('cmpf') or op.startswith('cmpi'):
             parts = op.split()
@@ -2319,6 +2323,32 @@ class CUDACodeGen:
             args = [self._get_var(o) for o in op.operands]
             self._emit(f'{cuda_type} {var} = {func_name}({", ".join(args)});')
 
+    def _emit_mulhiui(self, op: IROperation):
+        """Emit unsigned 32-bit multiply high: result = (a * b) >> 32."""
+        if not op.results or len(op.operands) < 2:
+            return
+        result = op.results[0]
+        a_var = self._get_var(op.operands[0])
+        b_var = self._get_var(op.operands[1])
+        is_tensor = any(self.ssa_is_tensor.get(o, False) for o in op.operands)
+
+        if is_tensor:
+            n_elems = max(self._get_num_elems(o) for o in op.operands if self.ssa_is_tensor.get(o, False))
+            var = self._new_var('mhi')
+            self._register_var(result.name, var, 'i32', is_tensor=True,
+                             shape=self.ssa_tensor_info.get(op.operands[0], ([],))[0],
+                             layout=self.ssa_tensor_info.get(op.operands[0], ([], None))[1])
+            self._emit(f'int {var}[{n_elems}];')
+            self._emit(f'#pragma unroll')
+            self._emit(f'for (int _i = 0; _i < {n_elems}; _i++)')
+            a = f'{a_var}[_i]' if self.ssa_is_tensor.get(op.operands[0], False) else a_var
+            b = f'{b_var}[_i]' if self.ssa_is_tensor.get(op.operands[1], False) else b_var
+            self._emit(f'    {var}[_i] = __umulhi((unsigned){a}, (unsigned){b});')
+        else:
+            var = self._new_var('mhi')
+            self._register_var(result.name, var, 'i32')
+            self._emit(f'const int {var} = __umulhi((unsigned){a_var}, (unsigned){b_var});')
+
     def _emit_atomic_rmw(self, op: IROperation):
         if not op.results:
             return
@@ -2736,6 +2766,14 @@ class CUDACodeGen:
     def _extract_result_type(self, op: IROperation) -> str:
         """Extract the result element type from an op's type annotation."""
         raw = op.raw_text
+        # For conversion ops like "arith.extui : i32 to i64", result type is after "to"
+        m_to = re.search(r'\bto\s+(tensor<[^>]+>|\S+)\s*$', raw)
+        if m_to:
+            t = m_to.group(1).strip()
+            if t.startswith('tensor<'):
+                return self._get_scalar_type(t)
+            if t in MLIR_TO_CUDA_TYPE:
+                return t
         # Look for the result type after ->
         m = re.search(r'->\s*(\S+)', raw)
         if m:
