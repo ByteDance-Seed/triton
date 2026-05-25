@@ -2992,6 +2992,7 @@ class CUDAEmitter:
 
         # Extract metadata
         self.kernel_name = codegen.kernel_name
-        self.shared_mem_size = ir_module.shared_size
+        # shared_mem_size: use the larger of module attribute and emitter's own tracking
+        self.shared_mem_size = max(ir_module.shared_size, codegen.shared_mem_offset)
 
         return cuda_src
