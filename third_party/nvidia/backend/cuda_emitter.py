@@ -1095,7 +1095,12 @@ class CUDACodeGen:
         elif name in ('ttg.memdesc_subview', 'ttg.memdesc_index'):
             self._emit_memdesc_subview(op)
         elif name == 'ttg.local_dealloc':
-            self._emit(f'// local_dealloc (no-op in CUDA)')
+            self._emit(f'// local_dealloc → reset shared memory for reuse')
+            # Track peak before resetting
+            if not hasattr(self, 'peak_shared_mem'):
+                self.peak_shared_mem = 0
+            self.peak_shared_mem = max(self.peak_shared_mem, self.shared_mem_offset)
+            self.shared_mem_offset = 0
         elif name == 'gpu.barrier':
             self._emit('__syncthreads();')
         # NVGPUIR ops (sm90a features)
@@ -3159,6 +3164,7 @@ class CUDAEmitter:
         # Extract metadata
         self.kernel_name = codegen.kernel_name
         # shared_mem_size: use the larger of module attribute and emitter's own tracking
-        self.shared_mem_size = max(ir_module.shared_size, codegen.shared_mem_offset)
+        peak = getattr(codegen, 'peak_shared_mem', 0)
+        self.shared_mem_size = max(ir_module.shared_size, codegen.shared_mem_offset, peak)
 
         return cuda_src
