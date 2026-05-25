@@ -346,25 +346,76 @@ KERNELS["04-low-memory-dropout"] = textwrap.dedent("""\
         print("RESULT:"+json.dumps({"name":"04-low-memory-dropout","compile":False,"error":str(e)[:300]}))
 """)
 
-# ---------- 06 fused-attention (simplified as compile-only for now) ----------
-# Note: Full fused attention uses tensor descriptors which need more emitter work
-# We test a simplified version here
+# ---------- 09 TMA matmul (from tutorial 09's non-persistent variant) ----------
+KERNELS["09-tma-matmul"] = textwrap.dedent("""\
+    @triton.jit
+    def matmul_kernel_tma(a_desc, b_desc, c_desc, M, N, K,
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+        pid_m = pid % num_pid_m
+        pid_n = pid // num_pid_m
+        offs_am = pid_m * BLOCK_SIZE_M
+        offs_bn = pid_n * BLOCK_SIZE_N
+        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+            a = a_desc.load([offs_am, k * BLOCK_SIZE_K])
+            b = b_desc.load([k * BLOCK_SIZE_K, offs_bn])
+            accumulator = tl.dot(a, b, accumulator)
+        c = accumulator.to(tl.float16)
+        c_desc.store([offs_am, offs_bn], c)
+
+    from triton.tools.tensor_descriptor import TensorDescriptor
+    torch.manual_seed(42); M_t,N_t,K_t=512,512,512
+    a_t=torch.randn((M_t,K_t),device=DEVICE,dtype=torch.float16)
+    b_t=torch.randn((K_t,N_t),device=DEVICE,dtype=torch.float16)
+    a_desc=TensorDescriptor(a_t,[M_t,K_t],[K_t,1],[128,32])
+    b_desc=TensorDescriptor(b_t,[K_t,N_t],[N_t,1],[32,128])
+    grid_t=lambda META:(triton.cdiv(M_t,META['BLOCK_SIZE_M'])*triton.cdiv(N_t,META['BLOCK_SIZE_N']),)
+    # emit_cuda path
+    c_cuda=torch.empty((M_t,N_t),device=DEVICE,dtype=torch.float16)
+    c_desc=TensorDescriptor(c_cuda,[M_t,N_t],[N_t,1],[128,128])
+    try:
+        matmul_kernel_tma[grid_t](a_desc,b_desc,c_desc,M_t,N_t,K_t,
+            BLOCK_SIZE_M=128,BLOCK_SIZE_N=128,BLOCK_SIZE_K=32,GROUP_SIZE_M=8,
+            num_warps=4,num_stages=3,emit_cuda=True)
+        torch.cuda.synchronize()
+        # standard triton path
+        matmul_kernel_tma.device_caches.clear()
+        shutil.rmtree(os.path.expanduser('~/.triton/cache'),ignore_errors=True)
+        c_ref=torch.empty((M_t,N_t),device=DEVICE,dtype=torch.float16)
+        c_desc_ref=TensorDescriptor(c_ref,[M_t,N_t],[N_t,1],[128,128])
+        matmul_kernel_tma[grid_t](a_desc,b_desc,c_desc_ref,M_t,N_t,K_t,
+            BLOCK_SIZE_M=128,BLOCK_SIZE_N=128,BLOCK_SIZE_K=32,GROUP_SIZE_M=8,
+            num_warps=4,num_stages=3)
+        torch.cuda.synchronize()
+        match=torch.equal(c_ref,c_cuda)
+        maxd=torch.max(torch.abs(c_ref.float()-c_cuda.float())).item()
+        t1=triton.testing.do_bench(lambda:matmul_kernel_tma[grid_t](a_desc,b_desc,c_desc_ref,M_t,N_t,K_t,
+            BLOCK_SIZE_M=128,BLOCK_SIZE_N=128,BLOCK_SIZE_K=32,GROUP_SIZE_M=8,
+            num_warps=4,num_stages=3),return_mode='median')
+        matmul_kernel_tma.device_caches.clear()
+        t2=triton.testing.do_bench(lambda:matmul_kernel_tma[grid_t](a_desc,b_desc,c_desc,M_t,N_t,K_t,
+            BLOCK_SIZE_M=128,BLOCK_SIZE_N=128,BLOCK_SIZE_K=32,GROUP_SIZE_M=8,
+            num_warps=4,num_stages=3,emit_cuda=True),return_mode='median')
+        print("RESULT:"+json.dumps({"name":"09-tma-matmul","compile":True,"bitwise":match,"max_diff":maxd,
+            "triton_ms":round(t1,4),"cuda_ms":round(t2,4),"ratio":round(t2/t1,3) if t1>0 else -1}))
+    except Exception as e:
+        print("RESULT:"+json.dumps({"name":"09-tma-matmul","compile":False,"error":str(e)[:300]}))
+""")
 
 # ---------- 06 fused-attention ----------
-# Uses tensor descriptors (TMA) - requires additional emitter support
-# Skipped for now
+# Uses tensor descriptors (TMA) — could work now with TMA support
+# TODO: add test
 
 # ---------- 08 grouped-gemm ----------
-# Uses indirect dispatch + matmul - requires TMA and complex indexing
-# Skipped for now
-
-# ---------- 09 persistent-matmul ----------
-# Uses persistent kernel pattern + TMA
-# Skipped for now
+# Uses indirect dispatch + matmul
+# TODO: add test
 
 # ---------- 10 block-scaled-matmul ----------
 # Uses dot_scaled + FP4/FP8 - Blackwell (sm_100+) only
-# Skipped for now
+# Skipped
 
 # ---------- 11 programmatic-dependent-launch ----------
 # Test with USE_GDC=False (no PDL, just vector-add)
