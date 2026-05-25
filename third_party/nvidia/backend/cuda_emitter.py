@@ -1128,7 +1128,7 @@ class CUDACodeGen:
         elif name in ('ttng.tma_store_wait', 'ttng.async_tma_store_wait'):
             pendings = re.search(r'pendings\s*=\s*(\d+)', op.raw_text)
             n = pendings.group(1) if pendings else '0'
-            self._emit(f'asm volatile("cp.async.bulk.wait_group {n};");')
+            self._emit(f'asm volatile("cp.async.bulk.wait_group.read {n};");')
         elif name == 'ttng.async_copy_mbarrier_arrive':
             self._emit('// async_copy_mbarrier_arrive (handled by TMA)')
         elif name == 'tt.mulhiui':
@@ -2603,8 +2603,16 @@ class CUDACodeGen:
                 # Build the asm statement
                 self._emit(f'{{')
                 self.indent_level += 1
-                self._emit(f'uint64_t desc_a = ((uint64_t)((smem_addr_a + {a_byte_offset}) >> 4)) | 0x{self._get_desc_template_a(K_block, a_elem):016X}ULL;')
-                self._emit(f'uint64_t desc_b = ((uint64_t)((smem_addr_b + {b_byte_offset}) >> 4)) | 0x{self._get_desc_template_b(N_block, b_elem):016X}ULL;')
+                # A desc: contiguous dim = K, stride dim = M, swizzle from A's shared layout
+                elem_bytes_a = 2 if a_elem in ('f16', 'bf16') else 4
+                swizzle_a = 64 if K_block * elem_bytes_a >= 64 else (32 if K_block * elem_bytes_a >= 32 else 0)
+                desc_tmpl_a = self._get_wgmma_desc_template(swizzle_a, M_block)
+                # B desc: contiguous dim = N, stride dim = K, swizzle from B's shared layout
+                elem_bytes_b = 2 if b_elem in ('f16', 'bf16') else 4
+                swizzle_b = 128 if N_block * elem_bytes_b >= 128 else (64 if N_block * elem_bytes_b >= 64 else (32 if N_block * elem_bytes_b >= 32 else 0))
+                desc_tmpl_b = self._get_wgmma_desc_template(swizzle_b, K_block)
+                self._emit(f'uint64_t desc_a = ((uint64_t)((smem_addr_a + {a_byte_offset}) >> 4)) | 0x{desc_tmpl_a:016X}ULL;')
+                self._emit(f'uint64_t desc_b = ((uint64_t)((smem_addr_b + {b_byte_offset}) >> 4)) | 0x{desc_tmpl_b:016X}ULL;')
 
                 # Generate the asm volatile statement
                 # Use "+f" (read-write) for accumulator registers
@@ -2637,32 +2645,18 @@ class CUDACodeGen:
         self.indent_level -= 1
         self._emit(f'}}')
 
-    def _get_desc_template_a(self, K: int, elem: str) -> int:
-        """Compute the static part of shared memory descriptor for operand A.
-        Based on the SMEMDescriptor union structure."""
-        elem_bytes = 2 if elem in ('f16', 'bf16') else 4  # f16/bf16 = 2, f32/tf32 = 4
-        swizzle_bytes = 64 if K * elem_bytes >= 64 else (32 if K * elem_bytes >= 32 else 0)
+    def _get_wgmma_desc_template(self, swizzle_bytes: int, stride_dim_size: int) -> int:
+        """Compute the static part of a WGMMA shared memory descriptor.
 
-        desc = 0
-        # swizzlingMode (bits 62:63)
-        if swizzle_bytes == 128:
-            desc |= (1 << 62)
-        elif swizzle_bytes == 64:
-            desc |= (2 << 62)
-        elif swizzle_bytes == 32:
-            desc |= (3 << 62)
-        # strideDimensionBaseOffset (bits 32:45) = swizzle_bytes / 2
-        desc |= ((swizzle_bytes >> 1) & 0x3FFF) << 32
-        # leadDimensionBaseOffset (bits 16:29) = (swizzle_bytes * K * elem_bytes) / 16
-        stride = K * elem_bytes  # stride in bytes along the non-contiguous dimension
-        desc |= (((swizzle_bytes * stride) >> 4) & 0x3FFF) << 16
-        return desc
+        Args:
+            swizzle_bytes: Swizzling byte width (0, 32, 64, or 128)
+            stride_dim_size: Size (in elements) of the non-contiguous (stride) dimension
 
-    def _get_desc_template_b(self, N: int, elem: str) -> int:
-        """Compute the static part of shared memory descriptor for operand B."""
-        elem_bytes = 2 if elem in ('f16', 'bf16') else 4
-        swizzle_bytes = 128 if N * elem_bytes >= 128 else (64 if N * elem_bytes >= 64 else (32 if N * elem_bytes >= 32 else 0))
-
+        The descriptor layout (SMEMDescriptor union):
+            bits[62:63] swizzlingMode: {0:none, 1:128B, 2:64B, 3:32B}
+            bits[32:45] strideDimensionBaseOffset: swizzle_bytes >> 1
+            bits[16:29] leadDimensionBaseOffset: (swizzle_bytes * stride_dim_size) >> 4
+        """
         desc = 0
         if swizzle_bytes == 128:
             desc |= (1 << 62)
@@ -2671,8 +2665,7 @@ class CUDACodeGen:
         elif swizzle_bytes == 32:
             desc |= (3 << 62)
         desc |= ((swizzle_bytes >> 1) & 0x3FFF) << 32
-        stride = N * elem_bytes
-        desc |= (((swizzle_bytes * stride) >> 4) & 0x3FFF) << 16
+        desc |= (((swizzle_bytes * stride_dim_size) >> 4) & 0x3FFF) << 16
         return desc
 
     def _emit_warp_group_dot_wait(self, op: IROperation):
@@ -2784,7 +2777,7 @@ class CUDACodeGen:
         if pred_var:
             self._emit(f'if ({pred_var}) {{')
             self.indent_level += 1
-        self._emit(f'asm volatile("mbarrier.expect_tx.shared::cta.b64 [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared({bar_var})), "r"({count_var}));')
+        self._emit(f'asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared({bar_var})), "r"({count_var}));')
         if pred_var:
             self.indent_level -= 1
             self._emit(f'}}')
@@ -2855,7 +2848,7 @@ class CUDACodeGen:
         extra_ops = re.findall(r'%[\w.\-]+(?:[:#]\d+)?', after_bracket.split(':')[0] if ':' in after_bracket else after_bracket)
         smem_var = self._get_var(extra_ops[0]) if extra_ops else 'nullptr'
 
-        self._emit(f'// TMA: cp.async.bulk.tensor.2d shared→global')
+        self._emit(f'// TMA: cp.async.bulk.tensor.2d shared→global + commit')
         self._emit(f'if (threadIdx.x == 0) {{')
         self.indent_level += 1
         self._emit(f'asm volatile(')
@@ -2864,6 +2857,7 @@ class CUDACodeGen:
         self._emit(f'       "r"({coord1}), "r"({coord0}),')
         self._emit(f'       "r"((unsigned)__cvta_generic_to_shared({smem_var}))')
         self._emit(f');')
+        self._emit(f'asm volatile("cp.async.bulk.commit_group;");')
         self.indent_level -= 1
         self._emit(f'}}')
 
