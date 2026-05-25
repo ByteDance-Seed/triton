@@ -2753,11 +2753,12 @@ class CUDACodeGen:
                     self.ssa_is_ptr_tensor[reg_name] = True
 
     def _emit_fence_async_shared(self, op: IROperation):
-        """Emit fence.proxy.async.shared::cta (or ::cluster)."""
+        """Emit fence.proxy.async.shared + bar.sync (Triton adds bar.sync after fence)."""
         if 'bCluster = true' in op.raw_text:
             self._emit('asm volatile("fence.proxy.async.shared::cluster;");')
         else:
             self._emit('asm volatile("fence.proxy.async.shared::cta;");')
+        self._emit('__syncthreads();')
 
     def _extract_barrier_ops(self, op: IROperation):
         """Extract operands from barrier ops, falling back to raw text parsing."""
