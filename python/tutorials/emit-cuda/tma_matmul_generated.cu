@@ -83,7 +83,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
     if (threadIdx.x == 0) {
         if (a44) {
             asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
                 :: "r"((unsigned)__cvta_generic_to_shared(sv45)),
                    "l"((uint64_t)&v1),
                    "r"(c23), "r"(a34),
@@ -96,7 +96,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
     if (threadIdx.x == 0) {
         if (a44) {
             asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
                 :: "r"((unsigned)__cvta_generic_to_shared(sv46)),
                    "l"((uint64_t)&v6),
                    "r"(a35), "r"(c23),
@@ -115,7 +115,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
     if (threadIdx.x == 0) {
         if (a47) {
             asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
                 :: "r"((unsigned)__cvta_generic_to_shared(sv48)),
                    "l"((uint64_t)&v1),
                    "r"(c24), "r"(a34),
@@ -128,7 +128,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
     if (threadIdx.x == 0) {
         if (a47) {
             asm volatile(
-                "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
                 :: "r"((unsigned)__cvta_generic_to_shared(sv49)),
                    "l"((uint64_t)&v6),
                    "r"(a35), "r"(c24),
@@ -258,7 +258,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
         if (threadIdx.x == 0) {
             if (a56) {
                 asm volatile(
-                    "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+                    "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
                     :: "r"((unsigned)__cvta_generic_to_shared(sv72)),
                        "l"((uint64_t)&v1),
                        "r"(a70), "r"(a34),
@@ -271,7 +271,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
         if (threadIdx.x == 0) {
             if (a56) {
                 asm volatile(
-                    "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+                    "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
                     :: "r"((unsigned)__cvta_generic_to_shared(sv73)),
                        "l"((uint64_t)&v6),
                        "r"(a35), "r"(a70),
