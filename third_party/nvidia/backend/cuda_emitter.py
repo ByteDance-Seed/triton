@@ -2283,12 +2283,53 @@ class CUDACodeGen:
         self._emit(f'{cuda_type}* {var} = ({cuda_type}*)(shared_mem + {offset});')
 
         if has_source:
-            # local_alloc with source: store the tensor to shared memory
             src_var = self._get_var(op.operands[0])
             src_is_tensor = self.ssa_is_tensor.get(op.operands[0], False)
-            if src_is_tensor:
+            src_info = self.ssa_tensor_info.get(op.operands[0])
+            src_layout = src_info[1] if src_info else None
+
+            if src_is_tensor and isinstance(src_layout, MMALayout):
+                # MMA layout → shared memory: use stmatrix
+                # Pattern from Triton LLVM IR for 128×128 output with 128 threads:
+                # Base address: complex bit manipulation of tid for swizzle
+                # 16 stmatrix.m8n8.x4 calls per thread
                 n_elems = self._get_num_elems(op.operands[0])
-                self._emit(f'// Store to shared memory for WGMMA')
+                self._emit(f'// MMA→shared via stmatrix (128×128 f16, swizzle=128B)')
+                self._emit(f'{{')
+                self.indent_level += 1
+                # Compute swizzled base address (from Triton LLVM IR)
+                self._emit(f'uint32_t _base = ((tid << 7) & 0x780) | ((tid << 4) & 0x70);')
+                self._emit(f'_base = (_base ^ (tid & 0x10)) | ((tid << 6) & 0x1800);')
+                self._emit(f'char* _smem_base = (char*)(shared_mem + {offset});')
+                # Pack f32→f16 pairs into i32 for stmatrix
+                self._emit(f'uint32_t _packed[64];')
+                self._emit(f'#pragma unroll')
+                self._emit(f'for (int _i = 0; _i < 64; _i++) {{')
+                self.indent_level += 1
+                self._emit(f'__half _h0 = (__half){src_var}[2*_i];')
+                self._emit(f'__half _h1 = (__half){src_var}[2*_i+1];')
+                self._emit(f'uint32_t _lo = *(uint16_t*)&_h0;')
+                self._emit(f'uint32_t _hi = *(uint16_t*)&_h1;')
+                self._emit(f'_packed[_i] = _lo | (_hi << 16);')
+                self.indent_level -= 1
+                self._emit(f'}}')
+                # 16 stmatrix calls: 4 n-groups × 4 sub-tiles
+                smem_offsets = [0, 16384, 8192, 24576]
+                for n_grp in range(4):
+                    for sub in range(4):
+                        packed_start = n_grp * 4 + sub * 16
+                        xor_val = n_grp * 32
+                        smem_off = smem_offsets[sub]
+                        addr_expr = f'_base ^ {xor_val}' if xor_val else '_base'
+                        self._emit(f'asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {{%1,%2,%3,%4}};"')
+                        self._emit(f'    :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + ({addr_expr}) + {smem_off})),')
+                        self._emit(f'       "r"(_packed[{packed_start}]), "r"(_packed[{packed_start+1}]),')
+                        self._emit(f'       "r"(_packed[{packed_start+2}]), "r"(_packed[{packed_start+3}]));')
+                self.indent_level -= 1
+                self._emit(f'}}')
+            elif src_is_tensor:
+                n_elems = self._get_num_elems(op.operands[0])
+                self._emit(f'// Store to shared memory (linear)')
                 self._emit(f'#pragma unroll')
                 self._emit(f'for (int _i = 0; _i < {n_elems}; _i++)')
                 self._emit(f'    {var}[tid * {n_elems} + _i] = {src_var}[_i];')
@@ -2572,6 +2613,12 @@ class CUDACodeGen:
         self._emit(f'uint32_t smem_addr_b = (unsigned)__cvta_generic_to_shared({b_var});')
         self._emit_blank()
 
+        # Pre-compute swizzle info for descriptor templates
+        elem_bytes_a = 2 if a_elem in ('f16', 'bf16') else 4
+        swizzle_a = 64 if K_block * elem_bytes_a >= 64 else (32 if K_block * elem_bytes_a >= 32 else 0)
+        elem_bytes_b = 2 if b_elem in ('f16', 'bf16') else 4
+        swizzle_b = 128 if N_block * elem_bytes_b >= 128 else (64 if N_block * elem_bytes_b >= 64 else (32 if N_block * elem_bytes_b >= 32 else 0))
+
         # Emit wgmma.fence
         self._emit(f'asm volatile("wgmma.fence.sync.aligned;");')
         self._emit_blank()
@@ -2581,9 +2628,15 @@ class CUDACodeGen:
             acc_base = m_tile * n_out_regs
             for k_tile in range(n_k_tiles):
                 # Compute descriptor offsets
-                # A descriptor: base + m_tile * wgmma_m * K_block * elem_bytes + k_tile * wgmma_k * elem_bytes
-                a_byte_offset = m_tile * wgmma_m * K_block * 2 + k_tile * wgmma_k * 2  # f16 = 2 bytes
-                b_byte_offset = k_tile * wgmma_k * N_block * 2  # B is KxN
+                # A descriptor: base + m_tile * wgmma_m * K_stride + k_tile * wgmma_k * elem_bytes
+                # A's row stride in smem = K_block * elem_bytes (K is contiguous for A)
+                a_byte_offset = m_tile * wgmma_m * K_block * 2 + k_tile * wgmma_k * 2
+
+                # B descriptor: k_tile * wgmma_k * B_row_stride
+                # B's row stride in smem = min(N_block, swizzle_B/elem_bytes) * elem_bytes
+                # because B may be split into multiple TMA copies by swizzle width
+                b_row_stride = min(N_block, swizzle_b // elem_bytes_b) * elem_bytes_b
+                b_byte_offset = k_tile * wgmma_k * b_row_stride
 
                 # Build the output register list
                 out_regs = ', '.join([f'"=f"({{var}}[{acc_base + i}])'.format(var=var) for i in range(n_out_regs)])
@@ -2880,10 +2933,7 @@ class CUDACodeGen:
             self._emit(f'}}')
 
     def _emit_tma_copy_l2g(self, op: IROperation):
-        """Emit TMA shared-to-global copy: cp.async.bulk.tensor.2d PTX.
-
-        TTGIR: ttng.async_tma_copy_local_to_global %desc[%x, %y] %smem
-        """
+        """Emit TMA shared-to-global copy with splitting (same logic as g2l)."""
         raw = op.raw_text
         operands = op.operands
         desc_var = self._get_var(operands[0]) if operands else 'nullptr'
@@ -2893,18 +2943,49 @@ class CUDACodeGen:
         coord1 = self._get_var(coord_match.group(2)) if coord_match else '0'
 
         after_bracket = raw.split(']', 1)[-1] if ']' in raw else raw
-        extra_ops = re.findall(r'%[\w.\-]+(?:[:#]\d+)?', after_bracket.split(':')[0] if ':' in after_bracket else after_bracket)
+        type_start = after_bracket.find(' : ')
+        if type_start >= 0:
+            after_bracket = after_bracket[:type_start]
+        extra_ops = re.findall(r'%[\w.\-]+(?:[:#]\d+)?', after_bracket)
         smem_var = self._get_var(extra_ops[0]) if extra_ops else 'nullptr'
 
-        self._emit(f'// TMA: cp.async.bulk.tensor.2d shared→global + commit')
+        # Determine splitting from tensordesc type and shared layout
+        tile_shape = [128, 128]  # default
+        tile_match = re.search(r'tensordesc<tensor<(\d+)x(\d+)x(\w+)', raw)
+        elem_type = 'f16'
+        if tile_match:
+            tile_shape = [int(tile_match.group(1)), int(tile_match.group(2))]
+            elem_type = tile_match.group(3)
+
+        swizzle_bytes = 128
+        layout_match = re.search(r'tensordesc<tensor<[^,]+,\s*(#\w+)', raw)
+        if layout_match:
+            layout_name = layout_match.group(1)
+            layout = self.module.layout_aliases.get(layout_name)
+            if isinstance(layout, SharedLayout) and layout.vec > 1:
+                swizzle_bytes = layout.vec
+
+        elem_bytes = {'f16': 2, 'bf16': 2, 'f32': 4}.get(elem_type, 2)
+        max_contig_elems = swizzle_bytes // elem_bytes
+        contig_dim = tile_shape[1]
+        n_copies = max(1, (contig_dim + max_contig_elems - 1) // max_contig_elems)
+        actual_contig = min(contig_dim, max_contig_elems)
+        smem_copy_bytes = tile_shape[0] * actual_contig * elem_bytes
+
+        self._emit(f'// TMA l2g: tile=[{tile_shape[0]}x{tile_shape[1]}], copies={n_copies}')
         self._emit(f'if (threadIdx.x == 0) {{')
         self.indent_level += 1
-        self._emit(f'asm volatile(')
-        self._emit(f'    "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group [%0, {{%1, %2}}], [%3];\\n"')
-        self._emit(f'    :: "l"((uint64_t)&{desc_var}),')
-        self._emit(f'       "r"({coord1}), "r"({coord0}),')
-        self._emit(f'       "r"((unsigned)__cvta_generic_to_shared({smem_var}))')
-        self._emit(f');')
+        for copy_idx in range(n_copies):
+            contig_offset = copy_idx * actual_contig
+            smem_byte_offset = copy_idx * smem_copy_bytes
+            coord1_expr = f'({coord1} + {contig_offset})' if contig_offset else coord1
+            smem_expr = f'((char*){smem_var} + {smem_byte_offset})' if smem_byte_offset else smem_var
+            self._emit(f'asm volatile(')
+            self._emit(f'    "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group [%0, {{%1, %2}}], [%3];\\n"')
+            self._emit(f'    :: "l"((uint64_t)&{desc_var}),')
+            self._emit(f'       "r"({coord1_expr}), "r"({coord0}),')
+            self._emit(f'       "r"((unsigned)__cvta_generic_to_shared({smem_expr}))')
+            self._emit(f');')
         self._emit(f'asm volatile("cp.async.bulk.commit_group;");')
         self.indent_level -= 1
         self._emit(f'}}')

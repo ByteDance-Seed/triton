@@ -222,7 +222,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
             }
             {
                 uint64_t desc_a = ((uint64_t)((smem_addr_a + 32) >> 4)) | 0x8000002002000000ULL;
-                uint64_t desc_b = ((uint64_t)((smem_addr_b + 4096) >> 4)) | 0x4000004001000000ULL;
+                uint64_t desc_b = ((uint64_t)((smem_addr_b + 2048) >> 4)) | 0x4000004001000000ULL;
                 asm volatile(
                     "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, %65, 1, 1, 1, 0, 1;"
                     : "+f"(wgmma65[0]), "+f"(wgmma65[1]), "+f"(wgmma65[2]), "+f"(wgmma65[3]), "+f"(wgmma65[4]), "+f"(wgmma65[5]), "+f"(wgmma65[6]), "+f"(wgmma65[7])
@@ -254,7 +254,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
             }
             {
                 uint64_t desc_a = ((uint64_t)((smem_addr_a + 4128) >> 4)) | 0x8000002002000000ULL;
-                uint64_t desc_b = ((uint64_t)((smem_addr_b + 4096) >> 4)) | 0x4000004001000000ULL;
+                uint64_t desc_b = ((uint64_t)((smem_addr_b + 2048) >> 4)) | 0x4000004001000000ULL;
                 asm volatile(
                     "wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16 {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31, %32, %33, %34, %35, %36, %37, %38, %39, %40, %41, %42, %43, %44, %45, %46, %47, %48, %49, %50, %51, %52, %53, %54, %55, %56, %57, %58, %59, %60, %61, %62, %63}, %64, %65, 1, 1, 1, 0, 1;"
                     : "+f"(wgmma65[64]), "+f"(wgmma65[65]), "+f"(wgmma65[66]), "+f"(wgmma65[67]), "+f"(wgmma65[68]), "+f"(wgmma65[69]), "+f"(wgmma65[70]), "+f"(wgmma65[71])
@@ -343,18 +343,99 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
     for (int _i = 0; _i < 128; _i++)
         a74[_i] = ((__half)iter51[_i]);
     __half* smem75 = (__half*)(shared_mem + 49280);
-    // Store to shared memory for WGMMA
-    #pragma unroll
-    for (int _i = 0; _i < 128; _i++)
-        smem75[tid * 128 + _i] = a74[_i];
+    // MMA→shared via stmatrix (128×128 f16, swizzle=128B)
+    {
+        uint32_t _base = ((tid << 7) & 0x780) | ((tid << 4) & 0x70);
+        _base = (_base ^ (tid & 0x10)) | ((tid << 6) & 0x1800);
+        char* _smem_base = (char*)(shared_mem + 49280);
+        uint32_t _packed[64];
+        #pragma unroll
+        for (int _i = 0; _i < 64; _i++) {
+            __half _h0 = (__half)a74[2*_i];
+            __half _h1 = (__half)a74[2*_i+1];
+            uint32_t _lo = *(uint16_t*)&_h0;
+            uint32_t _hi = *(uint16_t*)&_h1;
+            _packed[_i] = _lo | (_hi << 16);
+        }
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base) + 0)),
+               "r"(_packed[0]), "r"(_packed[1]),
+               "r"(_packed[2]), "r"(_packed[3]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base) + 16384)),
+               "r"(_packed[16]), "r"(_packed[17]),
+               "r"(_packed[18]), "r"(_packed[19]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base) + 8192)),
+               "r"(_packed[32]), "r"(_packed[33]),
+               "r"(_packed[34]), "r"(_packed[35]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base) + 24576)),
+               "r"(_packed[48]), "r"(_packed[49]),
+               "r"(_packed[50]), "r"(_packed[51]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 32) + 0)),
+               "r"(_packed[4]), "r"(_packed[5]),
+               "r"(_packed[6]), "r"(_packed[7]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 32) + 16384)),
+               "r"(_packed[20]), "r"(_packed[21]),
+               "r"(_packed[22]), "r"(_packed[23]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 32) + 8192)),
+               "r"(_packed[36]), "r"(_packed[37]),
+               "r"(_packed[38]), "r"(_packed[39]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 32) + 24576)),
+               "r"(_packed[52]), "r"(_packed[53]),
+               "r"(_packed[54]), "r"(_packed[55]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 64) + 0)),
+               "r"(_packed[8]), "r"(_packed[9]),
+               "r"(_packed[10]), "r"(_packed[11]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 64) + 16384)),
+               "r"(_packed[24]), "r"(_packed[25]),
+               "r"(_packed[26]), "r"(_packed[27]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 64) + 8192)),
+               "r"(_packed[40]), "r"(_packed[41]),
+               "r"(_packed[42]), "r"(_packed[43]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 64) + 24576)),
+               "r"(_packed[56]), "r"(_packed[57]),
+               "r"(_packed[58]), "r"(_packed[59]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 96) + 0)),
+               "r"(_packed[12]), "r"(_packed[13]),
+               "r"(_packed[14]), "r"(_packed[15]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 96) + 16384)),
+               "r"(_packed[28]), "r"(_packed[29]),
+               "r"(_packed[30]), "r"(_packed[31]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 96) + 8192)),
+               "r"(_packed[44]), "r"(_packed[45]),
+               "r"(_packed[46]), "r"(_packed[47]));
+        asm volatile("stmatrix.sync.aligned.m8n8.x4.shared.b16 [%0], {%1,%2,%3,%4};"
+            :: "r"((unsigned)__cvta_generic_to_shared(_smem_base + (_base ^ 96) + 24576)),
+               "r"(_packed[60]), "r"(_packed[61]),
+               "r"(_packed[62]), "r"(_packed[63]));
+    }
     asm volatile("fence.proxy.async.shared::cta;");
-    // TMA: cp.async.bulk.tensor.2d shared→global + commit
+    // TMA l2g: tile=[128x128], copies=2
     if (threadIdx.x == 0) {
         asm volatile(
             "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group [%0, {%1, %2}], [%3];\n"
             :: "l"((uint64_t)&v11),
                "r"(a35), "r"(a34),
                "r"((unsigned)__cvta_generic_to_shared(smem75))
+        );
+        asm volatile(
+            "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group [%0, {%1, %2}], [%3];\n"
+            :: "l"((uint64_t)&v11),
+               "r"((a35 + 64)), "r"(a34),
+               "r"((unsigned)__cvta_generic_to_shared(((char*)smem75 + 16384)))
         );
         asm volatile("cp.async.bulk.commit_group;");
     }
