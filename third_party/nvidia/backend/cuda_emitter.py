@@ -2792,23 +2792,23 @@ class CUDACodeGen:
         """Emit TMA global-to-shared copy: cp.async.bulk.tensor.2d PTX.
 
         TTGIR: ttng.async_tma_copy_global_to_local %desc[%x, %y] %smem, %bar, %pred
-        Only elected leader executes. Runtime predicate guards the copy.
-        Triton adds bar.sync before each TMA copy.
+        Only thread 0 executes. Runtime predicate guards the copy.
+
+        When the tile's contiguous dimension exceeds the swizzle width, Triton
+        splits into multiple TMA copies. We detect this from the shared layout's
+        swizzlingByteWidth and the tensordesc's tile shape, and emit multiple
+        TMA instructions with adjusted coordinates and smem offsets.
         """
         raw = op.raw_text
         operands = op.operands
 
-        # Extract desc (first operand)
         desc_var = self._get_var(operands[0]) if operands else 'nullptr'
 
-        # Extract coordinates from [%x, %y] in raw text
         coord_match = re.search(r'\[(%[\w.\-]+(?:[:#]\d+)?),\s*(%[\w.\-]+(?:[:#]\d+)?)\]', raw)
         coord0 = self._get_var(coord_match.group(1)) if coord_match else '0'
         coord1 = self._get_var(coord_match.group(2)) if coord_match else '0'
 
-        # Extract: smem_dest, barrier, pred from operands after the bracket
         after_bracket = raw.split(']', 1)[-1] if ']' in raw else raw
-        # Split on ':' to avoid matching type annotations, but be careful with '::' in types
         type_start = after_bracket.find(' : ')
         if type_start >= 0:
             after_bracket = after_bracket[:type_start]
@@ -2817,25 +2817,67 @@ class CUDACodeGen:
         bar_var = self._get_var(extra_ops[1]) if len(extra_ops) > 1 else 'nullptr'
         pred_var = self._get_var(extra_ops[2]) if len(extra_ops) > 2 else None
 
+        # Determine number of TMA copies from tensordesc shape and shared layout
+        # Extract tile shape from tensordesc type: !tt.tensordesc<tensor<MxNxf16, #shared>>
+        tile_shape = [0, 0]
+        tile_match = re.search(r'tensordesc<tensor<(\d+)x(\d+)x(\w+)', raw)
+        if tile_match:
+            tile_shape = [int(tile_match.group(1)), int(tile_match.group(2))]
+            elem_type = tile_match.group(3)
+        else:
+            elem_type = 'f16'
+
+        # Get swizzle info from the shared layout in the tensordesc type
+        # Match the exact layout alias (e.g., #shared1 not #shared)
+        swizzle_bytes = 128  # default
+        # Extract the layout from tensordesc<tensor<MxNxT, #layout>>
+        layout_match = re.search(r'tensordesc<tensor<[^,]+,\s*(#\w+)', raw)
+        if layout_match:
+            layout_name = layout_match.group(1)
+            layout = self.module.layout_aliases.get(layout_name)
+            if isinstance(layout, SharedLayout) and layout.vec > 1:
+                swizzle_bytes = layout.vec
+
+        elem_bytes = {'f16': 2, 'bf16': 2, 'f32': 4, 'f64': 8, 'i8': 1, 'i16': 2}.get(elem_type, 2)
+        max_contig_elems = swizzle_bytes // elem_bytes
+        contig_dim = tile_shape[1]  # second dim is contiguous (innermost)
+        n_copies = max(1, (contig_dim + max_contig_elems - 1) // max_contig_elems) if max_contig_elems > 0 else 1
+        actual_contig = min(contig_dim, max_contig_elems)
+        smem_copy_bytes = tile_shape[0] * actual_contig * elem_bytes
+
         self._emit(f'__syncthreads();')
-        self._emit(f'// TMA: cp.async.bulk.tensor.2d global→shared')
-        self._emit(f'if (threadIdx.x == 0) {{')
-        self.indent_level += 1
-        if pred_var:
-            self._emit(f'if ({pred_var}) {{')
+        self._emit(f'// TMA g2l: tile=[{tile_shape[0]}x{tile_shape[1]}], swizzle={swizzle_bytes}B, copies={n_copies}')
+
+        for copy_idx in range(n_copies):
+            contig_offset = copy_idx * actual_contig
+            smem_byte_offset = copy_idx * smem_copy_bytes
+
+            self._emit(f'if (threadIdx.x == {copy_idx * 32}) {{')  # different warp per copy
             self.indent_level += 1
-        self._emit(f'asm volatile(')
-        self._emit(f'    "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {{%2, %3}}], [%4];\\n"')
-        self._emit(f'    :: "r"((unsigned)__cvta_generic_to_shared({smem_var})),')
-        self._emit(f'       "l"((uint64_t)&{desc_var}),')
-        self._emit(f'       "r"({coord1}), "r"({coord0}),')
-        self._emit(f'       "r"((unsigned)__cvta_generic_to_shared({bar_var}))')
-        self._emit(f');')
-        if pred_var:
+            if pred_var:
+                self._emit(f'if ({pred_var}) {{')
+                self.indent_level += 1
+
+            if contig_offset == 0:
+                coord1_expr = coord1
+                smem_expr = smem_var
+            else:
+                coord1_expr = f'({coord1} + {contig_offset})'
+                smem_expr = f'((__half*)((char*){smem_var} + {smem_byte_offset}))'
+
+            self._emit(f'asm volatile(')
+            self._emit(f'    "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {{%2, %3}}], [%4];\\n"')
+            self._emit(f'    :: "r"((unsigned)__cvta_generic_to_shared({smem_expr})),')
+            self._emit(f'       "l"((uint64_t)&{desc_var}),')
+            self._emit(f'       "r"({coord1_expr}), "r"({coord0}),')
+            self._emit(f'       "r"((unsigned)__cvta_generic_to_shared({bar_var}))')
+            self._emit(f');')
+
+            if pred_var:
+                self.indent_level -= 1
+                self._emit(f'}}')
             self.indent_level -= 1
             self._emit(f'}}')
-        self.indent_level -= 1
-        self._emit(f'}}')
 
     def _emit_tma_copy_l2g(self, op: IROperation):
         """Emit TMA shared-to-global copy: cp.async.bulk.tensor.2d PTX.

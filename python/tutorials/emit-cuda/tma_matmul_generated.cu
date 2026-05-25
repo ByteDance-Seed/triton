@@ -73,13 +73,15 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
     }
     __syncthreads();
     const bool a44 = (a37 > c23);
+    __syncthreads();
     if (threadIdx.x == 0) {
         if (a44) {
             asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared(sv41)), "r"(16384));
         }
     }
     __half* sv45 = (__half*)((char*)smem38 + c23 * 8192);
-    // TMA: cp.async.bulk.tensor.2d global→shared
+    __syncthreads();
+    // TMA g2l: tile=[128x32], swizzle=64B, copies=1
     if (threadIdx.x == 0) {
         if (a44) {
             asm volatile(
@@ -92,7 +94,8 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
         }
     }
     __half* sv46 = (__half*)((char*)smem39 + c23 * 8192);
-    // TMA: cp.async.bulk.tensor.2d global→shared
+    __syncthreads();
+    // TMA g2l: tile=[32x128], swizzle=128B, copies=2
     if (threadIdx.x == 0) {
         if (a44) {
             asm volatile(
@@ -104,14 +107,27 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
             );
         }
     }
+    if (threadIdx.x == 32) {
+        if (a44) {
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+                :: "r"((unsigned)__cvta_generic_to_shared(((__half*)((char*)sv46 + 4096)))),
+                   "l"((uint64_t)&v6),
+                   "r"((a35 + 64)), "r"(c23),
+                   "r"((unsigned)__cvta_generic_to_shared(sv41))
+            );
+        }
+    }
     const bool a47 = (a37 > c22);
+    __syncthreads();
     if (threadIdx.x == 0) {
         if (a47) {
             asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared(sv42)), "r"(16384));
         }
     }
     __half* sv48 = (__half*)((char*)smem38 + c22 * 8192);
-    // TMA: cp.async.bulk.tensor.2d global→shared
+    __syncthreads();
+    // TMA g2l: tile=[128x32], swizzle=64B, copies=1
     if (threadIdx.x == 0) {
         if (a47) {
             asm volatile(
@@ -124,7 +140,8 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
         }
     }
     __half* sv49 = (__half*)((char*)smem39 + c22 * 8192);
-    // TMA: cp.async.bulk.tensor.2d global→shared
+    __syncthreads();
+    // TMA g2l: tile=[32x128], swizzle=128B, copies=2
     if (threadIdx.x == 0) {
         if (a47) {
             asm volatile(
@@ -132,6 +149,17 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
                 :: "r"((unsigned)__cvta_generic_to_shared(sv49)),
                    "l"((uint64_t)&v6),
                    "r"(a35), "r"(c24),
+                   "r"((unsigned)__cvta_generic_to_shared(sv42))
+            );
+        }
+    }
+    if (threadIdx.x == 32) {
+        if (a47) {
+            asm volatile(
+                "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+                :: "r"((unsigned)__cvta_generic_to_shared(((__half*)((char*)sv49 + 4096)))),
+                   "l"((uint64_t)&v6),
+                   "r"((a35 + 64)), "r"(c24),
                    "r"((unsigned)__cvta_generic_to_shared(sv42))
             );
         }
@@ -150,6 +178,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
         const int a60 = (iter54 ^ c22);
         const int a61 = (a58 ? a60 : iter54);
         int64_t* sv62 = (int64_t*)((char*)smem40 + a59 * 8);
+        __syncthreads();
         {
             uint32_t bar_addr = (unsigned)__cvta_generic_to_shared(sv62);
             asm volatile(
@@ -188,7 +217,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
                       , "+f"(wgmma65[40]), "+f"(wgmma65[41]), "+f"(wgmma65[42]), "+f"(wgmma65[43]), "+f"(wgmma65[44]), "+f"(wgmma65[45]), "+f"(wgmma65[46]), "+f"(wgmma65[47])
                       , "+f"(wgmma65[48]), "+f"(wgmma65[49]), "+f"(wgmma65[50]), "+f"(wgmma65[51]), "+f"(wgmma65[52]), "+f"(wgmma65[53]), "+f"(wgmma65[54]), "+f"(wgmma65[55])
                       , "+f"(wgmma65[56]), "+f"(wgmma65[57]), "+f"(wgmma65[58]), "+f"(wgmma65[59]), "+f"(wgmma65[60]), "+f"(wgmma65[61]), "+f"(wgmma65[62]), "+f"(wgmma65[63])
-                    : "l"(desc_a), "l"(desc_b), "n"(1)
+                    : "l"(desc_a), "l"(desc_b)
                 );
             }
             {
@@ -204,7 +233,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
                       , "+f"(wgmma65[40]), "+f"(wgmma65[41]), "+f"(wgmma65[42]), "+f"(wgmma65[43]), "+f"(wgmma65[44]), "+f"(wgmma65[45]), "+f"(wgmma65[46]), "+f"(wgmma65[47])
                       , "+f"(wgmma65[48]), "+f"(wgmma65[49]), "+f"(wgmma65[50]), "+f"(wgmma65[51]), "+f"(wgmma65[52]), "+f"(wgmma65[53]), "+f"(wgmma65[54]), "+f"(wgmma65[55])
                       , "+f"(wgmma65[56]), "+f"(wgmma65[57]), "+f"(wgmma65[58]), "+f"(wgmma65[59]), "+f"(wgmma65[60]), "+f"(wgmma65[61]), "+f"(wgmma65[62]), "+f"(wgmma65[63])
-                    : "l"(desc_a), "l"(desc_b), "n"(1)
+                    : "l"(desc_a), "l"(desc_b)
                 );
             }
             {
@@ -220,7 +249,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
                       , "+f"(wgmma65[104]), "+f"(wgmma65[105]), "+f"(wgmma65[106]), "+f"(wgmma65[107]), "+f"(wgmma65[108]), "+f"(wgmma65[109]), "+f"(wgmma65[110]), "+f"(wgmma65[111])
                       , "+f"(wgmma65[112]), "+f"(wgmma65[113]), "+f"(wgmma65[114]), "+f"(wgmma65[115]), "+f"(wgmma65[116]), "+f"(wgmma65[117]), "+f"(wgmma65[118]), "+f"(wgmma65[119])
                       , "+f"(wgmma65[120]), "+f"(wgmma65[121]), "+f"(wgmma65[122]), "+f"(wgmma65[123]), "+f"(wgmma65[124]), "+f"(wgmma65[125]), "+f"(wgmma65[126]), "+f"(wgmma65[127])
-                    : "l"(desc_a), "l"(desc_b), "n"(1)
+                    : "l"(desc_a), "l"(desc_b)
                 );
             }
             {
@@ -236,7 +265,7 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
                       , "+f"(wgmma65[104]), "+f"(wgmma65[105]), "+f"(wgmma65[106]), "+f"(wgmma65[107]), "+f"(wgmma65[108]), "+f"(wgmma65[109]), "+f"(wgmma65[110]), "+f"(wgmma65[111])
                       , "+f"(wgmma65[112]), "+f"(wgmma65[113]), "+f"(wgmma65[114]), "+f"(wgmma65[115]), "+f"(wgmma65[116]), "+f"(wgmma65[117]), "+f"(wgmma65[118]), "+f"(wgmma65[119])
                       , "+f"(wgmma65[120]), "+f"(wgmma65[121]), "+f"(wgmma65[122]), "+f"(wgmma65[123]), "+f"(wgmma65[124]), "+f"(wgmma65[125]), "+f"(wgmma65[126]), "+f"(wgmma65[127])
-                    : "l"(desc_a), "l"(desc_b), "n"(1)
+                    : "l"(desc_a), "l"(desc_b)
                 );
             }
             asm volatile("wgmma.commit_group.sync.aligned;");
@@ -248,13 +277,15 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
         const int a69 = (iv50 + c27);
         const int a70 = (a69 * c24);
         int64_t* sv71 = (int64_t*)((char*)smem40 + a68 * 8);
+        __syncthreads();
         if (threadIdx.x == 0) {
             if (a56) {
                 asm volatile("mbarrier.arrive.expect_tx.shared.b64 _, [%0], %1;" :: "r"((unsigned)__cvta_generic_to_shared(sv71)), "r"(16384));
             }
         }
         __half* sv72 = (__half*)((char*)smem38 + a68 * 8192);
-        // TMA: cp.async.bulk.tensor.2d global→shared
+        __syncthreads();
+        // TMA g2l: tile=[128x32], swizzle=64B, copies=1
         if (threadIdx.x == 0) {
             if (a56) {
                 asm volatile(
@@ -267,7 +298,8 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
             }
         }
         __half* sv73 = (__half*)((char*)smem39 + a68 * 8192);
-        // TMA: cp.async.bulk.tensor.2d global→shared
+        __syncthreads();
+        // TMA g2l: tile=[32x128], swizzle=128B, copies=2
         if (threadIdx.x == 0) {
             if (a56) {
                 asm volatile(
@@ -275,6 +307,17 @@ matmul_kernel_tma(const __grid_constant__ CUtensorMap v1, int v2, int v3, int64_
                     :: "r"((unsigned)__cvta_generic_to_shared(sv73)),
                        "l"((uint64_t)&v6),
                        "r"(a35), "r"(a70),
+                       "r"((unsigned)__cvta_generic_to_shared(sv71))
+                );
+            }
+        }
+        if (threadIdx.x == 32) {
+            if (a56) {
+                asm volatile(
+                    "cp.async.bulk.tensor.2d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];\n"
+                    :: "r"((unsigned)__cvta_generic_to_shared(((__half*)((char*)sv73 + 4096)))),
+                       "l"((uint64_t)&v6),
+                       "r"((a35 + 64)), "r"(a70),
                        "r"((unsigned)__cvta_generic_to_shared(sv71))
                 );
             }
