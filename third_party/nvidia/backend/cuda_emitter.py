@@ -2725,11 +2725,13 @@ class CUDACodeGen:
             self._emit(f'__syncthreads();')
 
     def _emit_wait_barrier(self, op: IROperation):
-        """Emit mbarrier wait. All threads wait."""
+        """Emit mbarrier wait. Sync all threads first (bar.sync 0), then all threads wait."""
         bar_ops = self._extract_barrier_ops(op)
         if bar_ops:
             bar_var = self._get_var(bar_ops[0])
             phase = self._get_var(bar_ops[1]) if len(bar_ops) > 1 else '0'
+            # Triton adds bar.sync before wait to ensure all threads are synchronized
+            self._emit(f'__syncthreads();')
             self._emit(f'{{')
             self.indent_level += 1
             self._emit(f'uint32_t bar_addr = (unsigned)__cvta_generic_to_shared({bar_var});')
@@ -2752,7 +2754,9 @@ class CUDACodeGen:
             self._emit(f'asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];" :: "r"((unsigned)__cvta_generic_to_shared({bar_var})));')
 
     def _emit_barrier_expect(self, op: IROperation):
-        """Emit mbarrier expect_tx. Only thread 0, with optional runtime predicate."""
+        """Emit mbarrier arrive.expect_tx. Only thread 0, with optional runtime predicate.
+        Triton adds bar.sync before this op."""
+        self._emit(f'__syncthreads();')
         bar_ops = self._extract_barrier_ops(op)
         if not bar_ops:
             return
@@ -2788,7 +2792,8 @@ class CUDACodeGen:
         """Emit TMA global-to-shared copy: cp.async.bulk.tensor.2d PTX.
 
         TTGIR: ttng.async_tma_copy_global_to_local %desc[%x, %y] %smem, %bar, %pred
-        Only thread 0 executes. Runtime predicate guards the copy.
+        Only elected leader executes. Runtime predicate guards the copy.
+        Triton adds bar.sync before each TMA copy.
         """
         raw = op.raw_text
         operands = op.operands
@@ -2812,6 +2817,7 @@ class CUDACodeGen:
         bar_var = self._get_var(extra_ops[1]) if len(extra_ops) > 1 else 'nullptr'
         pred_var = self._get_var(extra_ops[2]) if len(extra_ops) > 2 else None
 
+        self._emit(f'__syncthreads();')
         self._emit(f'// TMA: cp.async.bulk.tensor.2d global→shared')
         self._emit(f'if (threadIdx.x == 0) {{')
         self.indent_level += 1
