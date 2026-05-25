@@ -2628,7 +2628,7 @@ class CUDACodeGen:
                     self._emit(f'  , {", ".join(chunk)}')
 
                 # Input operands (descriptors + scale)
-                in_parts = ['"l"(desc_a)', '"l"(desc_b)', '"n"(1)']
+                in_parts = ['"l"(desc_a)', '"l"(desc_b)']
                 self._emit(f': {", ".join(in_parts)}')
 
                 self.indent_level -= 1
