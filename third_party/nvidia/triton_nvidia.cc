@@ -1,4 +1,5 @@
 #include "Dialect/NVGPU/IR/Dialect.h"
+#include "TritonGPUToCUDA/TritonGPUToCUDA.h"
 #include "Dialect/NVWS/IR/Dialect.h"
 #include "NVGPUToLLVM/Passes.h"
 #include "TritonNVIDIAGPUToLLVM/Passes.h"
@@ -161,6 +162,19 @@ void init_triton_nvidia(py::module &&m) {
             << self.clusterDimZ << ")";
         return oss.str();
       });
+
+  // CUDA emitter: translate TTGIR → CUDA C++ source
+  m.def("translate_ttgir_to_cuda",
+        [](mlir::ModuleOp &mod, int32_t capability, int32_t numWarps,
+           int32_t numCtas) -> py::dict {
+          auto result = mlir::triton::translateTritonGPUToCUDA(
+              mod, capability, numWarps, numCtas);
+          py::dict ret;
+          ret["cuda_src"] = result.cudaSource;
+          ret["kernel_name"] = result.kernelName;
+          ret["shared_mem_size"] = result.sharedMemSize;
+          return ret;
+        });
 
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {

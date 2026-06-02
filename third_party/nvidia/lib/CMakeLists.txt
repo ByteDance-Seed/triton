@@ -1,3 +1,4 @@
 add_subdirectory(Dialect)
 add_subdirectory(TritonNVIDIAGPUToLLVM)
 add_subdirectory(NVGPUToLLVM)
+add_subdirectory(TritonGPUToCUDA)

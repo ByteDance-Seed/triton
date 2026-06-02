@@ -1,5 +1,9 @@
 from triton.backends.compiler import BaseBackend, GPUTarget, Language
-from triton._C.libtriton import ir, passes, llvm, nvidia, distributed
+from triton._C.libtriton import ir, passes, llvm, nvidia
+try:
+    from triton._C.libtriton import distributed
+except ImportError:
+    distributed = None
 from triton import knobs
 from triton.runtime.errors import PTXASError
 
@@ -132,6 +136,9 @@ class CUDAOptions:
     emit_cuda: bool = False  # If True, emit CUDA C++ code instead of going through LLVM/PTX
 
     def __post_init__(self):
+        # TRITON_EMIT_CUDA=1 forces CUDA emitter for all kernels
+        if os.environ.get("TRITON_EMIT_CUDA", "") == "1" and not self.emit_cuda:
+            object.__setattr__(self, 'emit_cuda', True)
         default_libdir = Path(__file__).parent / 'lib'
         extern_libs = {} if self.extern_libs is None else dict(self.extern_libs)
         if not extern_libs.get('libdevice', None):
@@ -222,7 +229,7 @@ class CUDABackend(BaseBackend):
         return {"triton.language.extra.libdevice": libdevice}
 
     def load_dialects(self, ctx):
-        distributed.ir.load_dialects(ctx)
+        distributed.ir.load_dialects(ctx) if distributed else None
         nvidia.load_dialects(ctx)
         if CUDABackend.instrumentation:
             CUDABackend.instrumentation.load_dialects(ctx)
@@ -257,8 +264,11 @@ class CUDABackend(BaseBackend):
             cluster_info.clusterDimZ = opt.cluster_dims[2]
         pm = ir.pass_manager(mod.context)
         dump_enabled = pm.enable_debug()
-        # TritonDistributed Extension
-        distributed.passes.ttir.add_convert_to_ttgpuir_ext(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        # TritonDistributed Extension (or standard path)
+        if distributed:
+            distributed.passes.ttir.add_convert_to_ttgpuir_ext(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
+        else:
+            passes.ttir.add_convert_to_ttgpuir(pm, f"cuda:{capability}", opt.num_warps, 32, opt.num_ctas)
         # optimize TTGIR
         passes.ttgpuir.add_coalesce(pm)
         if capability // 10 >= 8:
@@ -364,7 +374,8 @@ class CUDABackend(BaseBackend):
             CUDABackend.instrumentation.patch("ttgpuir_to_llvmir", pm, mod.context)
         nvidia.passes.ttgpuir.add_to_llvmir(pm, capability, ptx_version)
         # TritonDistributed Extension: Distributed/SIMT Dialect -> LLVM
-        distributed.passes.ttgpuir.nvidia.add_convert_triton_distributed_to_llvm(pm, capability, ptx_version)
+        if distributed:
+            distributed.passes.ttgpuir.nvidia.add_convert_triton_distributed_to_llvm(pm, capability, ptx_version)
         passes.common.add_canonicalizer(pm)
         passes.common.add_cse(pm)
         nvidia.passes.ttnvgpuir.add_nvgpu_to_llvm(pm)
@@ -514,23 +525,30 @@ please share the reproducer above with Triton project.
         return cubin
 
     def make_cuda(self, src, metadata, options, capability):
-        """Translate TTGIR module to CUDA C++ source code."""
-        from .cuda_emitter import CUDAEmitter
-        emitter = CUDAEmitter(
-            capability=capability,
-            num_warps=options.num_warps,
-            num_ctas=options.num_ctas,
-        )
-        cuda_src = emitter.emit(src)
-        metadata["name"] = emitter.kernel_name
-        metadata["shared"] = emitter.shared_mem_size
+        """Translate TTGIR module to CUDA C++ source code via C++ MLIR pass."""
+        # Dump TTGIR for debugging
+        ttgir_dump = os.environ.get("TRITON_CUDA_DUMP_TTGIR")
+        if ttgir_dump:
+            print("=== TTGIR (input to CUDA emitter) ===")
+            print(src)
+            print("=== END TTGIR ===")
+        from triton._C.libtriton import nvidia
+        result = nvidia.translate_ttgir_to_cuda(
+            src, capability, options.num_warps, options.num_ctas)
+        cuda_src = result["cuda_src"]
+        metadata["name"] = result["kernel_name"]
+        metadata["shared"] = result["shared_mem_size"]
+        if os.environ.get("TRITON_CUDA_DEBUG"):
+            print(f"[CUDA emitter] shared_mem_size={result['shared_mem_size']}, kernel={result['kernel_name']}")
+        # Dump for debugging
+        dump_path = os.environ.get("TRITON_CUDA_DUMP")
+        if dump_path:
+            with open(dump_path, "w") as f:
+                f.write(cuda_src)
         # Set metadata that would normally come from LLVM lowering
-        if "tmem_size" not in metadata:
-            metadata["tmem_size"] = 0
-        if "global_scratch_size" not in metadata:
-            metadata["global_scratch_size"] = 0
-        if "global_scratch_align" not in metadata:
-            metadata["global_scratch_align"] = 0
+        for key in ("tmem_size", "global_scratch_size", "global_scratch_align",
+                    "profile_scratch_size", "profile_scratch_align", "maxntid"):
+            metadata.setdefault(key, 0)
         return cuda_src
 
     def make_cubin_from_cuda(self, src, metadata, options, capability):
@@ -549,6 +567,7 @@ please share the reproducer above with Triton project.
                 f'--gpu-architecture={arch}',
                 '-O3',
                 '--use_fast_math',
+                '-maxrregcount=255',
                 *fmad,
                 '-std=c++17',
                 fsrc.name,

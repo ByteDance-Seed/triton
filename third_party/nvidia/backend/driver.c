@@ -140,15 +140,15 @@ static PyObject *loadBinary(PyObject *self, PyObject *args) {
   CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuDeviceGetAttribute(
       &shared_optin, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
       device));
-  if (shared > 49152 && shared_optin > 49152) {
+  // Query static shared memory used by the cubin (e.g. nvcc may allocate
+  // static __shared__ arrays for reduction buffers).  The opt-in check must
+  // account for dynamic + static exceeding the default 48 KB limit.
+  int shared_static = 0;
+  CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuFuncGetAttribute(
+      &shared_static, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fun));
+  if (shared + shared_static > 49152 && shared_optin > 49152) {
     CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
         cuFuncSetCacheConfig(fun, CU_FUNC_CACHE_PREFER_SHARED));
-    int shared_total, shared_static;
-    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuDeviceGetAttribute(
-        &shared_total, CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
-        device));
-    CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(cuFuncGetAttribute(
-        &shared_static, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, fun));
     CUDA_CHECK_AND_RETURN_NULL_ALLOW_THREADS(
         cuFuncSetAttribute(fun, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                            shared_optin - shared_static));

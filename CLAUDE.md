@@ -52,7 +52,7 @@
 | File | Purpose |
 |------|---------|
 | `third_party/nvidia/backend/compiler.py` | 编译管线 (`add_stages`, `make_cuda`, `make_cubin_from_cuda`) |
-| `third_party/nvidia/backend/cuda_emitter.py` | **核心**: CUDA 代码生成器 (~2700 行) |
+| `third_party/nvidia/lib/TritonGPUToCUDA/CUDACodeGen.cpp` | **核心**: C++ CUDA 代码生成器 |
 | `python/triton/compiler/compiler.py` | 通用编译框架 (增加 `cuda` 格式支持) |
 | `docs/emit-cuda/design.md` | 完整设计文档 (含 sm90a WGMMA/TMA 翻译细节) |
 | `docs/emit-cuda/op-mapping.md` | Op 翻译对照表 (TTGIR + NVGPUIR → CUDA) |
@@ -81,14 +81,26 @@ add_kernel[grid](x, y, output, n, BLOCK_SIZE=1024, emit_cuda=True)
 
 ```bash
 # 在 Docker 容器 zhengsize-vibecuda 中运行
-export TRITON_BACKENDS_IN_TREE=1
+# (代码目录 mount 在容器内同一路径)
+docker exec -w /data00/zheng.size/share/triton-cuda zhengsize-vibecuda <cmd>
 
-# 运行所有 kernel 编译测试 (vector-add, relu, softmax, matmul-wgmma)
-python python/tutorials/emit-cuda/_test_compile_all.py
+# 回归测试 —— 每次修改 CUDA 后端后，测试受影响的 tutorial
+# 每个 tutorial 含正确性校验 + 性能 benchmark，单个跑完约 2-8 分钟
+# ⚠️ 一次只测一个 tutorial，不要全跑，太慢
+python python/tutorials/emit-cuda/run_all_tests.py 01            # 只跑 vector-add
+python python/tutorials/emit-cuda/run_all_tests.py 03            # 只跑 matmul
+python python/tutorials/emit-cuda/run_all_tests.py 01 03         # 跑指定的几个
 
-# vector-add 端到端正确性 + 性能测试
-python python/tutorials/emit-cuda/_test_small.py
-python python/tutorials/emit-cuda/_test_e2e.py
+# 分组跑（仅在大版本验证时使用）
+python python/tutorials/emit-cuda/run_all_tests.py --group 1     # 01-04: basic
+python python/tutorials/emit-cuda/run_all_tests.py --group 2     # 05-08: intermediate
+python python/tutorials/emit-cuda/run_all_tests.py --group 3     # 09-11: advanced (TMA/PDL)
+
+# harness 会自动：
+#   - 流式输出 stdout（含性能数据）
+#   - 检测 Traceback / 非零退出码 → FAIL
+#   - 检查 emit-cuda/ 下有无遗留临时文件
+#   - --check-files 可检查 tutorial 源码是否被意外修改
 ```
 
 ## Results (H800, sm90, CUDA 12.2)
@@ -159,4 +171,3 @@ python python/tutorials/emit-cuda/_test_e2e.py
 - Base: `dist`
 - Working directory: `/data00/zheng.size/share/triton-cuda`
 - Docker: `zhengsize-vibecuda` (H800, CUDA 12.2, triton 3.7.0)
-- 环境变量: `TRITON_BACKENDS_IN_TREE=1` (跳过 tilelang driver 冲突)
