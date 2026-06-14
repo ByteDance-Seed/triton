@@ -13,4 +13,8 @@ add_triton_library(TritonGPUToCUDA
     MLIRMathDialect
     MLIRSCFDialect
     MLIRGPUDialect
+    MLIRControlFlowDialect
+    MLIRControlFlowToSCF
+    MLIRUBDialect
+    MLIRTransformUtils
 )

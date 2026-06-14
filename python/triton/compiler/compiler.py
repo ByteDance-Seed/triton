@@ -397,12 +397,41 @@ class LazyDict:
         self.extras.append((func, args))
 
 
+def _ptx_from_cuda(cuda_src, target):
+    """Derive PTX from emitter-generated CUDA source (emit_cuda pipeline has no
+    native ptx stage). Lazy: only runs when asm["ptx"] is requested, e.g. by
+    tests asserting on atom/ld/st flavors."""
+    import subprocess
+    import tempfile
+    capability = getattr(target, "arch", 90)
+    arch = f"sm_{capability}{'a' if capability >= 90 else ''}"
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.cu', delete=False) as f:
+        f.write(cuda_src)
+        src_path = f.name
+    ptx_path = src_path + '.ptx'
+    try:
+        subprocess.run([
+            'nvcc', '-ptx', f'--gpu-architecture={arch}', '-O3', '--use_fast_math', '-std=c++17', src_path, '-o',
+            ptx_path
+        ], check=True, capture_output=True)
+        with open(ptx_path) as f:
+            return f.read()
+    finally:
+        for p in (src_path, ptx_path):
+            if os.path.exists(p):
+                os.remove(p)
+
+
 class AsmDict(dict):
+    # set by CompiledKernel so lazily derived artifacts know the arch
+    target = None
 
     def __missing__(self, key):
 
         if key == "sass":
             value = get_sass(self["cubin"])
+        elif key == "ptx" and "cuda" in self:
+            value = _ptx_from_cuda(self["cuda"], self.target)
         else:
             raise KeyError("Unknown key: '%s'" % key)
 
@@ -438,6 +467,7 @@ class CompiledKernel:
             file.suffix[1:]: file.read_bytes() if file.suffix[1:] == binary_ext else file.read_text()
             for file in asm_files if file.exists()
         })
+        self.asm.target = self.metadata.target
         self.metadata_group = metadata_group
         self.kernel = self.asm[binary_ext]
         # binaries are lazily initialized

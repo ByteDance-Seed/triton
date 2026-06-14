@@ -31,6 +31,7 @@
     │+NVGPUIR │  ttng.warp_group_dot, ttng.fence_async_shared, ...
     └────┬────┘
          ▼
+         还需要lower一下IR，到合适的语义之后进行emit cuda
     ┌─────────────────────────────────────────────────────┐
     │  CUDAEmitter (cuda_emitter.py, ~2700 行)            │
     │  ├─ MLIRTextParser: 解析 TTGIR+NVGPUIR MLIR text   │
@@ -82,92 +83,26 @@ add_kernel[grid](x, y, output, n, BLOCK_SIZE=1024, emit_cuda=True)
 ```bash
 # 在 Docker 容器 zhengsize-vibecuda 中运行
 # (代码目录 mount 在容器内同一路径)
-docker exec -w /data00/zheng.size/share/triton-cuda zhengsize-vibecuda <cmd>
-
-# 回归测试 —— 每次修改 CUDA 后端后，测试受影响的 tutorial
-# 每个 tutorial 含正确性校验 + 性能 benchmark，单个跑完约 2-8 分钟
-# ⚠️ 一次只测一个 tutorial，不要全跑，太慢
-python python/tutorials/emit-cuda/run_all_tests.py 01            # 只跑 vector-add
-python python/tutorials/emit-cuda/run_all_tests.py 03            # 只跑 matmul
-python python/tutorials/emit-cuda/run_all_tests.py 01 03         # 跑指定的几个
-
-# 分组跑（仅在大版本验证时使用）
-python python/tutorials/emit-cuda/run_all_tests.py --group 1     # 01-04: basic
-python python/tutorials/emit-cuda/run_all_tests.py --group 2     # 05-08: intermediate
-python python/tutorials/emit-cuda/run_all_tests.py --group 3     # 09-11: advanced (TMA/PDL)
-
-# harness 会自动：
-#   - 流式输出 stdout（含性能数据）
-#   - 检测 Traceback / 非零退出码 → FAIL
-#   - 检查 emit-cuda/ 下有无遗留临时文件
-#   - --check-files 可检查 tutorial 源码是否被意外修改
+docker exec -w ~/share/triton-cuda zhengsize-vibecuda /bin/bash
+cd ~/share/triton-cuda
+pip3 install -e .
+rm -rf ~/.triton/cache # 测试时候每次清理cache
+TRITON_EMIT_CUDA=1 python3 python/tutorials/xxx.py
 ```
-
-## Results (H800, sm90, CUDA 12.2)
-
-| Kernel | CUDA Lines | cubin | Correctness | Perf | sm90a |
-|--------|-----------|-------|-------------|------|-------|
-| vector-add (f32) | 110 | 4.4KB | **BITWISE MATCH** | **1.65x faster** | - |
-| ReLU (f32) | 101 | 4.2KB | nvcc OK | - | - |
-| softmax (f32) | 140 | 8.0KB | nvcc OK | - | reduce (warp shuffle) |
-| matmul (fp16) | 443 | 14KB | nvcc OK | - | **WGMMA v3**, nvmma_shared |
-
-## sm90a NVGPUIR 支持
-
-### 已实现
-
-| Feature | TTGIR/NVGPUIR Op | CUDA 翻译 |
-|---------|-----------------|----------|
-| WGMMA | `ttng.warp_group_dot` | PTX `wgmma.mma_async.sync.aligned.m64n128k16.f32.f16.f16` |
-| WGMMA Wait | `ttng.warp_group_dot_wait` | PTX `wgmma.wait_group.sync.aligned N` |
-| WGMMA Fence | (内置于 dot emitter) | PTX `wgmma.fence.sync.aligned` + `wgmma.commit_group.sync.aligned` |
-| Async Fence | `ttng.fence_async_shared` | PTX `fence.proxy.async.shared::cta` |
-| Shared Mem Desc | 64-bit descriptor | swizzle mode + base addr + stride/lead dim |
-| mbarrier Init | `ttng.init_barrier` | PTX `mbarrier.init.shared::cta.b64` |
-| mbarrier Wait | `ttng.wait_barrier` | PTX `mbarrier.try_wait.parity` (loop) |
-| mbarrier Arrive | `ttng.arrive_barrier` | PTX `mbarrier.arrive.shared::cta.b64` |
-| mbarrier Expect | `ttng.barrier_expect` | PTX `mbarrier.expect_tx.shared::cta.b64` |
-| NVMMA Shared | `#ttg.nvmma_shared` layout | 128B-aligned alloc, swizzle descriptor |
-| MMA Layout | `#ttg.nvidia_mma<v3>` | per-thread elem 计算 |
-| Layout Conv | `ttg.convert_layout` #mma→#blocked | shared memory intermediary |
-
-### TODO
-
-| Feature | Op | 说明 |
-|---------|-----|------|
-| TMA Copy | `ttng.async_tma_copy_*` | 需要 host 端 tensor descriptor |
-| Warp Specialize | `ttg.warp_specialize` | 不同 warp group 执行不同代码 |
-| Tensor Memory | `ttng.tmem_*` | sm_100+ (Blackwell) |
-| stmatrix | layout conv 优化 | 替代 shared memory 中转 |
-
-## IR Dialects Reference
-
-### TTGIR 核心 Op
-- `tt.func` → kernel, `tt.get_program_id` → blockIdx
-- `tt.load`/`tt.store` → global memory, `tt.addptr` → 指针算术
-- `tt.dot` → 矩阵乘法, `tt.reduce` → reduction
-- `tt.make_range`/`tt.splat`/`tt.broadcast`/`tt.expand_dims` → 索引
-- `arith.*` (40+ ops), `math.*` (15+ ops) → 计算
-- `scf.for`/`scf.if`/`scf.yield` → 控制流
-- `ttg.local_alloc`/`ttg.local_load`/`ttg.local_store` → shared memory
-- `ttg.convert_layout` → layout 转换
-
-### NVGPUIR 核心 Op (sm90a)
-- `ttng.warp_group_dot` / `ttng.warp_group_dot_wait` → WGMMA
-- `ttng.fence_async_shared` → async fence
-- `ttng.init_barrier` / `ttng.wait_barrier` / `ttng.arrive_barrier` → mbarrier
-- `ttng.async_tma_copy_global_to_local` / `ttng.async_tma_copy_local_to_global` → TMA
-
-### Layout Types
-- `#ttg.blocked<{sizePerThread, threadsPerWarp, warpsPerCTA, order}>` → 基础分布
-- `#ttg.nvidia_mma<{versionMajor=3, warpsPerCTA, instrShape}>` → WGMMA 输出
-- `#ttg.nvmma_shared<{swizzlingByteWidth, transposed, elementBitWidth}>` → WGMMA 输入
-- `#ttg.slice<{dim, parent}>` → 切片 (去掉一个维度)
-- `#ttg.shared_memory` → 通用共享内存
 
 ## Development
 
 - Branch: `zsz/triton-cuda`
 - Base: `dist`
-- Working directory: `/data00/zheng.size/share/triton-cuda`
+- Working directory: `~/share/triton-cuda`
 - Docker: `zhengsize-vibecuda` (H800, CUDA 12.2, triton 3.7.0)
+
+注意事项：
+1. 清理debug时候的临时文件
+2. 清理测试性能输出的临时文件
+3. 不要信任临时写的test和测试性能的脚本，始终使用 `python/tutorials/` 下的官方 tutorial 来验证正确性和性能
+4. `asm volatile` 不会影响性能，不作为性能怀疑的原因
+5. nvcc 编译 CUDA 和 Triton 直接生成 PTX 理论上性能应该一样，如果达不到是生成的 CUDA 代码质量问题，不是 nvcc 的问题
+6. H800 性能常识：高度优化的 bf16 GEMM 性能应该在 800 TFLOPS，高度优化的 fp8 GEMM 性能应该在 1200 TFLOPS
+7. 测试性能必须用空闲 GPU，避免其他任务干扰导致性能数据不准确
+

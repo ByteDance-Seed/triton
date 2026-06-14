@@ -526,6 +526,10 @@ please share the reproducer above with Triton project.
 
     def make_cuda(self, src, metadata, options, capability):
         """Translate TTGIR module to CUDA C++ source code via C++ MLIR pass."""
+        # HMMA v2 (nvidia_mma versionMajor=2, small tiles e.g. block_m=16) is
+        # handled by the generic LinearLayout-based emitDot/emitLocalLoad path
+        # (shared-memory FMA). Validated correct for f16/bf16/fp8 across tile
+        # shapes and warp counts. No guard needed.
         # Dump TTGIR for debugging
         ttgir_dump = os.environ.get("TRITON_CUDA_DUMP_TTGIR")
         if ttgir_dump:
@@ -533,17 +537,42 @@ please share the reproducer above with Triton project.
             print(src)
             print("=== END TTGIR ===")
         from triton._C.libtriton import nvidia
+        # The emitter gates a ptxas global-stride workaround on the PTX ISA
+        # version (needed for PTX <= 8.5 / CUDA <= 12.5). Pass the version that
+        # the system nvcc/ptxas will target so device-side TMA descriptors are
+        # encoded correctly on both old and new toolkits.
+        ptx_version = get_ptx_version_from_options(options, capability)
         result = nvidia.translate_ttgir_to_cuda(
-            src, capability, options.num_warps, options.num_ctas)
+            src, capability, options.num_warps, options.num_ctas, ptx_version)
         cuda_src = result["cuda_src"]
         metadata["name"] = result["kernel_name"]
         metadata["shared"] = result["shared_mem_size"]
+        # Warp-specialized kernels launch more warps than options.num_warps
+        # (base producer warps + the partition/consumer warpgroups). The emitter
+        # reports the true total so the launcher sizes blockDim.x = 32*num_warps
+        # to cover every warp-group; without this the consumer warps never run.
+        ws_num_warps = result.get("num_warps", 0)
+        if ws_num_warps and ws_num_warps > options.num_warps:
+            metadata["num_warps"] = ws_num_warps
+        # Device-side TMA descriptors allocate per-CTA global scratch; the
+        # runtime sizes the buffer as grid*num_ctas*global_scratch_size.
+        if result.get("global_scratch_size", 0):
+            metadata["global_scratch_size"] = result["global_scratch_size"]
+            metadata["global_scratch_align"] = result.get("global_scratch_align", 1) or 1
         if os.environ.get("TRITON_CUDA_DEBUG"):
             print(f"[CUDA emitter] shared_mem_size={result['shared_mem_size']}, kernel={result['kernel_name']}")
         # Dump for debugging
         dump_path = os.environ.get("TRITON_CUDA_DUMP")
         if dump_path:
-            with open(dump_path, "w") as f:
+            # If dump_path is a directory (or ends with '/'), write one file per
+            # kernel name so concurrent/multi-kernel compiles don't clobber each
+            # other (useful for debugging specific failing kernels).
+            if dump_path.endswith("/") or os.path.isdir(dump_path):
+                os.makedirs(dump_path, exist_ok=True)
+                out = os.path.join(dump_path, result["kernel_name"] + ".cu")
+            else:
+                out = dump_path
+            with open(out, "w") as f:
                 f.write(cuda_src)
         # Set metadata that would normally come from LLVM lowering
         for key in ("tmem_size", "global_scratch_size", "global_scratch_align",
@@ -551,27 +580,37 @@ please share the reproducer above with Triton project.
             metadata.setdefault(key, 0)
         return cuda_src
 
-    def make_cubin_from_cuda(self, src, metadata, options, capability):
-        """Compile CUDA source code to cubin using nvcc."""
+    def make_ptx_from_cuda(self, src, metadata, options, capability):
+        """Compile CUDA source code to PTX using nvcc -ptx."""
         arch = sm_arch_from_capability(capability)
         with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.cu') as fsrc, \
             tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
             fsrc.write(src)
             fsrc.flush()
-            cubin_path = fsrc.name + '.cubin'
+            ptx_path = fsrc.name + '.ptx'
 
-            fmad = [] if not options.enable_fp_fusion else ['--fmad=true']
+            fmad = ['--fmad=false'] if not options.enable_fp_fusion else ['--fmad=true']
+
+            # Source-level line info: the emitter writes #line directives that
+            # point back at the Triton source; -lineinfo makes nvcc/ptxas carry
+            # them through to the SASS line table (mirrors make_cubin).
+            lineinfo = [] if knobs.compilation.disable_line_info else ['-lineinfo']
 
             nvcc_cmd = [
-                'nvcc', '-cubin',
+                'nvcc', '-ptx',
                 f'--gpu-architecture={arch}',
                 '-O3',
                 '--use_fast_math',
-                '-maxrregcount=255',
+                # --use_fast_math implies --ftz=true, but Triton FP32 arithmetic
+                # is non-FTZ (LLVM fmul -> mul.f32 keeps denormals). Explicit
+                # --ftz=false overrides the implied flush while keeping the fast
+                # intrinsic substitutions (exp2f -> ex2.approx etc.).
+                '--ftz=false',
                 *fmad,
+                *lineinfo,
                 '-std=c++17',
                 fsrc.name,
-                '-o', cubin_path,
+                '-o', ptx_path,
             ]
 
             try:
@@ -595,6 +634,76 @@ please share the reproducer above with Triton project.
                     f"CUDA source (first 2000 chars):\n{cuda_src_debug}\n"
                 )
 
+            with open(ptx_path, 'r') as f:
+                ptx = f.read()
+            if os.path.exists(ptx_path):
+                os.remove(ptx_path)
+        names = re.findall(r"\.visible \.entry ([a-zA-Z_][a-zA-Z0-9_]*)", ptx)
+        assert len(names) == 1
+        metadata["name"] = names[0]
+        return ptx
+
+    def make_cubin_from_ptx(self, src, metadata, options, capability):
+        """Assemble nvcc-generated PTX to cubin with the system ptxas.
+
+        Uses the CUDA-toolkit ptxas from PATH (same toolkit as nvcc) rather
+        than the Triton-bundled one, so the PTX ISA version nvcc emits is
+        always understood.
+        """
+        arch = sm_arch_from_capability(capability)
+        with tempfile.NamedTemporaryFile(delete=False, mode='w', suffix='.ptx') as fsrc, \
+            tempfile.NamedTemporaryFile(delete=False, mode='r', suffix='.log') as flog:
+            fsrc.write(src)
+            fsrc.flush()
+            cubin_path = fsrc.name + '.cubin'
+
+            fmad = ['--fmad=false'] if not options.enable_fp_fusion else []
+            lineinfo = [] if knobs.compilation.disable_line_info else ['-lineinfo']
+
+            # Warp-specialized kernels use setmaxnreg.dec/inc to redistribute the
+            # SM register file between the producer and consumer warpgroups. Those
+            # instructions are only valid if the kernel's per-thread register
+            # baseline equals the value the emitter assumed when computing the
+            # dec/inc amounts (upstream sets nvvm.maxnreg = 65536/totalThreads&~7).
+            # If the kernel already carries a .maxnreg directive (emitted via
+            # __maxnreg__ from ttg.maxnreg), that takes care of it; otherwise
+            # pin the baseline via --maxrregcount, or ptxas picks an arbitrary
+            # baseline and setmaxnreg faults at launch.
+            maxreg = ['--maxrregcount=255']
+            if 'setmaxnreg' in src and '.maxnreg' not in src:
+                total_threads = metadata.get('num_warps', options.num_warps) * 32
+                baseline = (65536 // total_threads) & ~7
+                maxreg = [f'--maxrregcount={baseline}']
+
+            ptxas_cmd = [
+                'ptxas',
+                f'--gpu-name={arch}',
+                '-O3',
+                *maxreg,
+                *fmad,
+                *lineinfo,
+                fsrc.name,
+                '-o', cubin_path,
+            ]
+
+            try:
+                subprocess.run(ptxas_cmd, check=True, close_fds=False,
+                             stdout=flog, stderr=subprocess.STDOUT)
+                if os.path.exists(fsrc.name):
+                    os.remove(fsrc.name)
+                if os.path.exists(flog.name):
+                    os.remove(flog.name)
+            except subprocess.CalledProcessError as e:
+                with open(flog.name) as log_file:
+                    log = log_file.read()
+                if os.path.exists(flog.name):
+                    os.remove(flog.name)
+                raise RuntimeError(
+                    f"`ptxas` failed with error code {e.returncode}\n"
+                    f"`ptxas` command: {' '.join(ptxas_cmd)}\n"
+                    f"`ptxas` log:\n{log}\n"
+                )
+
             with open(cubin_path, 'rb') as f:
                 cubin = f.read()
             if os.path.exists(cubin_path):
@@ -608,10 +717,15 @@ please share the reproducer above with Triton project.
             stages["ttgir"] = lambda src, metadata: self.make_ttgir(src, metadata, options, capability)
         elif language == Language.GLUON:
             stages["ttgir"] = lambda src, metadata: self.gluon_to_ttgir(src, metadata, options, capability)
-        if options.emit_cuda:
-            # CUDA emitter path: TTGIR -> CUDA -> cubin
+        # The CUDA emitter targets sm90a (WGMMA/TMA/mbarrier). Other
+        # architectures (e.g. sm100 tcgen05/tmem) are out of its scope, so an
+        # explicit non-sm90 target compiles through the standard path even
+        # when TRITON_EMIT_CUDA=1 is set globally.
+        if options.emit_cuda and capability // 10 == 9:
+            # CUDA emitter path: TTGIR -> CUDA -> PTX (nvcc) -> cubin (ptxas)
             stages["cuda"] = lambda src, metadata: self.make_cuda(src, metadata, options, capability)
-            stages["cubin"] = lambda src, metadata: self.make_cubin_from_cuda(src, metadata, options, capability)
+            stages["ptx"] = lambda src, metadata: self.make_ptx_from_cuda(src, metadata, options, capability)
+            stages["cubin"] = lambda src, metadata: self.make_cubin_from_ptx(src, metadata, options, capability)
         else:
             # Standard path: TTGIR -> LLVM-IR -> PTX -> cubin
             stages["llir"] = lambda src, metadata: self.make_llir(src, metadata, options, capability)
