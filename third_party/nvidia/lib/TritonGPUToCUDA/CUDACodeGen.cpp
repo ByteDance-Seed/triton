@@ -464,6 +464,21 @@ CUDATranslationResult CUDACodeGen::generate() {
   dedent();
   emit("}");
   emitBlank();
+  // f32 exp2: emit `ex2.approx.ftz.f32` directly, matching the PTX backend's
+  // exp2 lowering. The library `exp2f` lowers to non-FTZ `ex2.approx.f32`,
+  // which ptxas (under --ftz=false, required to keep general FP32 non-FTZ)
+  // wraps in a denormal-range guard (FSETP x,-126 / FMUL x,0.5 / square)
+  // around every EX2 — ~3x the FMUL and a flood of FSETP in softmax-style
+  // inner loops. The FTZ instruction needs no guard; flushing exp2 denormals
+  // (results < 2^-126) to zero is harmless for softmax and bit-matches Triton.
+  emit("__device__ __forceinline__ float __triton_ex2f(float x) {");
+  indent();
+  emit("float r;");
+  emit("asm(\"ex2.approx.ftz.f32 %0, %1;\" : \"=f\"(r) : \"f\"(x));");
+  emit("return r;");
+  dedent();
+  emit("}");
+  emitBlank();
   // RTZ float->e5m2: ptxas has no cvt.rz for fp8, so match the PTX
   // backend: f32 -> f16 with rz, then truncate to the high byte (e5m2
   // shares f16's exponent layout; dropping the low mantissa byte is rz).
@@ -2413,7 +2428,7 @@ void CUDACodeGen::emitMathOp(Operation *op) {
   // Map math ops to CUDA functions
   std::string fn = "unknown";
   if (opName.contains("exp2"))
-    fn = "exp2f";
+    fn = "exp2f"; // f32 routed to __triton_ex2f below (FTZ ex2.approx)
   else if (opName.contains("exp"))
     fn = "expf";
   else if (opName.contains("log2"))
@@ -2450,6 +2465,12 @@ void CUDACodeGen::emitMathOp(Operation *op) {
   // 'f', so stripping it yields the double variant.
   if (elemType.isF64() && fn != "unknown" && !fn.empty() && fn.back() == 'f')
     fn.pop_back();
+
+  // f32 exp2 -> FTZ ex2.approx helper (see __triton_ex2f above). f64 stays
+  // "exp2" (library); only the single-precision path hits ptxas's denormal
+  // guard, so only it needs rerouting.
+  if (fn == "exp2f")
+    fn = "__triton_ex2f";
 
   // abs is type-polymorphic: math.absi (integer) and math.absf (float, incl
   // fp8). Mapping every abs to fabsf is wrong for integers (loses precision for
@@ -3784,7 +3805,12 @@ void CUDACodeGen::emitStore(tt::StoreOp op) {
     int vecWidth = 1;
     if (auto blk = dyn_cast<ttg::BlockedEncodingAttr>(valRtt.getEncoding())) {
       auto spt = blk.getSizePerThread();
-      if (spt.size() >= 2) {
+      // 1D tensors (e.g. layer-norm's [BLOCK_SIZE] row) must vectorize too:
+      // the load path already does, but gating the store on >= 2 dims left 1D
+      // stores scalarized (32 STG.E instead of 4 STG.E.128), halving store
+      // bandwidth on memory-bound elementwise/reduce kernels. order[0] and
+      // spt[order[0]] are valid for rank-1 (order has size 1).
+      if (spt.size() >= 1) {
         // Vectorize along the contiguous axis order[0] (fastest-varying in the
         // register linearization), NOT the last tensor axis. For the common
         // row-major case order[0] == last axis, so this matches the old
@@ -4795,6 +4821,16 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
   auto var = newVar("red");
   valueToVar[result] = var;
 
+  // Effective warp count for this reduce. Inside a ttg.warp_specialize
+  // partition only `partWarps[i]` warps physically execute (the producer/
+  // consumer split), so the cross-warp combine must size its scratch and read
+  // back exactly that many warp slots — using the global `numWarps` (e.g. 4)
+  // in a 2-warp partition writes slots [0,1] but reads [0..3], pulling in
+  // uninitialized shared memory (intermittent wrong sums, manifests when a
+  // prior kernel left non-zero garbage in that smem). wsSyncThreadCount is the
+  // current region's thread count (set per WS region; 0 outside WS).
+  int effNumWarps = wsSyncThreadCount > 0 ? (wsSyncThreadCount / 32) : numWarps;
+
   // For multi-result reduces (e.g., max-with-indices), map all results
   std::string var1;
   if (numResults > 1) {
@@ -5213,7 +5249,7 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
         }
       }
       if (!axisWarpBits.empty()) {
-        int totalThreads = numWarps * 32;
+        int totalThreads = effNumWarps * 32;
         std::string bitsStr;
         for (int b : axisWarpBits)
           bitsStr += (bitsStr.empty() ? "" : ",") + std::to_string(b);
@@ -5399,8 +5435,8 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
       }
       // Cross-warp: representatives combined sequentially on warp 0 lane 0
       // (no identity needed), result broadcast through shared memory.
-      int gWarpDistinct = (numWarps - 1) & ~warpFreeMask;
-      if (numWarps > 1 && gWarpDistinct != 0) {
+      int gWarpDistinct = (effNumWarps - 1) & ~warpFreeMask;
+      if (effNumWarps > 1 && gWarpDistinct != 0) {
         emit("// Cross-warp reduction (generic combine)");
         emit("{");
         indent();
@@ -5417,7 +5453,7 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
             peakSharedMem = std::max(peakSharedMem, o + numWarps * 8);
           } else {
             emit("__shared__ " + accTypes[k] + " " + bufs[k] + "[" +
-                 std::to_string(numWarps) + "];");
+                 std::to_string(effNumWarps) + "];");
           }
         }
         std::string stStmt = "if (lane_id == 0) {";
@@ -5428,7 +5464,7 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
         blockSync();
         emit("if (warp_id == 0 && lane_id == 0) {");
         indent();
-        for (int w = 1; w < numWarps; w++) {
+        for (int w = 1; w < effNumWarps; w++) {
           if (w & warpFreeMask)
             continue; // duplicate of a representative warp
           SmallVector<std::string> others;
@@ -5452,7 +5488,7 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
 
     // Determine how many threads actually hold valid data
     // For a 1D tensor with blocked layout, only totalT0 threads have data
-    int totalActiveThreads = numWarps * 32; // default: all threads active
+    int totalActiveThreads = effNumWarps * 32; // default: all threads active
     if (auto srcRtt = dyn_cast<RankedTensorType>(src.getType())) {
       if (auto blocked = dyn_cast_or_null<ttg::BlockedEncodingAttr>(srcRtt.getEncoding())) {
         auto shape = srcRtt.getShape();
@@ -5466,7 +5502,7 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
         }
       }
     }
-    bool needsThreadGuard = totalActiveThreads < numWarps * 32;
+    bool needsThreadGuard = totalActiveThreads < effNumWarps * 32;
     // The thread guard de-duplicates differently: threads outside the active
     // range never accumulate and hold the IDENTITY (not duplicates), so the
     // blind combine over all lanes/warps is already correct. Applying the
@@ -5567,10 +5603,10 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
     // identical data — if no warp bit is data-distinct, every warp already
     // holds the full result and the cross-warp combine must be skipped
     // entirely (summing the duplicates gave numWarps× the answer).
-    int warpDistinctMask = (numWarps - 1) & ~warpFreeMask;
-    if (numWarps > 1 && warpDistinctMask == 0 && !isMultiResult) {
+    int warpDistinctMask = (effNumWarps - 1) & ~warpFreeMask;
+    if (effNumWarps > 1 && warpDistinctMask == 0 && !isMultiResult) {
       emit("// Cross-warp reduction skipped: all warps hold duplicate data");
-    } else if (numWarps > 1) {
+    } else if (effNumWarps > 1) {
       emit("// Cross-warp reduction");
       emit("{");
       indent();
@@ -5592,7 +5628,7 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
         peakSharedMem = std::max(peakSharedMem, wbOff + numWarps * 8);
       } else {
         emit("__shared__ " + accType + " " + bufName + "[" +
-             std::to_string(numWarps) + "];");
+             std::to_string(effNumWarps) + "];");
       }
       if (isMultiResult) {
         auto bufName1 = "_wb_" + var1;
@@ -5604,16 +5640,16 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
           peakSharedMem = std::max(peakSharedMem, wbOff1 + numWarps * 8);
         } else {
           emit("__shared__ " + cuda1Type + " " + bufName1 + "[" +
-               std::to_string(numWarps) + "];");
+               std::to_string(effNumWarps) + "];");
         }
         emit("if (lane_id == 0) { " + bufName + "[warp_id] = " + var + "; " +
              bufName1 + "[warp_id] = " + var1 + "; }");
         blockSync();
         emit("if (warp_id == 0) {");
         indent();
-        emit(var + " = (lane_id < " + std::to_string(numWarps) +
+        emit(var + " = (lane_id < " + std::to_string(effNumWarps) +
              ") ? " + bufName + "[lane_id] : " + identity + ";");
-        emit(var1 + " = (lane_id < " + std::to_string(numWarps) +
+        emit(var1 + " = (lane_id < " + std::to_string(effNumWarps) +
              ") ? " + bufName1 + "[lane_id] : 0;");
         emit("for (int _off = 16; _off > 0; _off /= 2) {");
         indent();
@@ -5639,7 +5675,7 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
         indent();
         // Only representative warps (free warp bits == 0) contribute; warps
         // differing in free bits hold duplicates of a representative.
-        std::string repCond = "lane_id < " + std::to_string(numWarps);
+        std::string repCond = "lane_id < " + std::to_string(effNumWarps);
         if (warpFreeMask != 0)
           repCond += " && (lane_id & " + std::to_string(warpFreeMask) +
                      ") == 0";
