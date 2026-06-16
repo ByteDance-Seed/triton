@@ -21,7 +21,7 @@ def run():
     y = torch.randn(n, device="cuda", dtype=torch.float32)
     out = torch.empty_like(x)
     grid = (triton.cdiv(n, 1024),)
-    add_mul_kernel[grid](x, y, out, n, BLOCK=1024)
+    add_mul_kernel[grid](x, y, out, n, BLOCK=1024, emit_cuda=True)
     torch.cuda.synchronize()
     ref = x * y + torch.exp(x) - torch.sqrt(torch.abs(y) + 1.0)
     ok = torch.allclose(out, ref, atol=1e-4, rtol=1e-4)

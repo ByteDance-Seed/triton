@@ -1,8 +1,10 @@
 """Non-invasive CUDA-C++ backend plugin for Triton.
 
-Importing this package installs the ``add_stages_inspection_hook`` that makes
-the nvidia backend emit CUDA C++ (compiled by nvcc/ptxas) instead of going
-through LLVM/PTX, for sm90 targets, when ``TRITON_EMIT_CUDA=1`` is set.
+Importing this package installs the ``add_stages_inspection_hook`` (and a
+``JITFunction.run`` patch enabling the per-launch ``emit_cuda=True`` kwarg) that
+make the nvidia backend emit CUDA C++ (compiled by nvcc/ptxas) instead of going
+through LLVM/PTX, for sm90 targets. Activate with ``TRITON_EMIT_CUDA=1`` or the
+``kernel[grid](..., emit_cuda=True)`` kwarg.
 
 It patches no Triton source file. The emitter ships as an out-of-tree shared
 library (``emit_cuda.so``) loaded via Triton's official plugin ABI

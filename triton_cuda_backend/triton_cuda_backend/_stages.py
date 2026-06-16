@@ -7,9 +7,12 @@ patching any Triton core file**.  It is wired in through the official
 backend invokes at the end of ``CUDABackend.add_stages`` with the live
 ``stages`` dict.
 
-Activation: set ``TRITON_EMIT_CUDA=1``.  Only sm90 (Hopper) targets are
-redirected; every other arch keeps the stock pipeline so a globally-set env var
-is still safe on non-Hopper GPUs.
+Activation, either of:
+  * ``TRITON_EMIT_CUDA=1`` (process-wide), or
+  * a per-launch ``kernel[grid](..., emit_cuda=True)`` kwarg (see
+    ``_install_run_patch``), which overrides the env var for that launch.
+Only sm90 (Hopper) targets are redirected; every other arch keeps the stock
+pipeline so a globally-set env var is still safe on non-Hopper GPUs.
 """
 from __future__ import annotations
 
@@ -18,8 +21,26 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 
 from triton import knobs
+
+# Per-launch activation flag set by the ``emit_cuda=`` kernel kwarg (see
+# ``_install_run_patch``). Thread-local so concurrent launches don't clobber
+# each other. ``None`` means "unset -> fall back to the env var".
+_tls = threading.local()
+
+
+def _emit_active():
+    """Whether the CUDA emitter should fire for the launch being compiled.
+
+    A per-launch ``emit_cuda=`` kwarg (thread-local) takes precedence; absent
+    that, the process-wide ``TRITON_EMIT_CUDA=1`` env var decides.
+    """
+    flag = getattr(_tls, "emit_cuda", None)
+    if flag is not None:
+        return bool(flag)
+    return os.environ.get("TRITON_EMIT_CUDA", "") == "1"
 
 
 def _resolve_tool(name):
@@ -245,13 +266,13 @@ def cuda_stages_hook(*args):
     """
     if len(args) == 0:
         # Cache-keying call. Only differentiate when the emitter is active.
-        if os.environ.get("TRITON_EMIT_CUDA", "") == "1":
+        if _emit_active():
             return ("cuda-emit-sm90", "cuda-emit-sm90")
         return ("", "")
 
     # Stage-rewriting call.
     backend, stages, options, language, capability = args
-    if os.environ.get("TRITON_EMIT_CUDA", "") != "1":
+    if not _emit_active():
         return
     if capability // 10 != 9:
         return
@@ -260,8 +281,44 @@ def cuda_stages_hook(*args):
     stages["cubin"] = lambda src, metadata: _make_cubin(src, metadata, options, capability)
 
 
+_run_patched = False
+
+
+def _install_run_patch():
+    """Make ``kernel[grid](..., emit_cuda=True)`` a per-launch activation toggle.
+
+    Triton's ``JITFunction.run`` binds every kwarg to the kernel signature
+    (``jit.py`` ``binder(*args, **kwargs)``), so an undeclared ``emit_cuda``
+    kwarg would raise. We wrap ``run`` to pop ``emit_cuda`` *before* binding and
+    expose it to ``cuda_stages_hook`` via the thread-local; the wrapped call
+    happens before both the cache-key hook and stage rewrite, so the choice is
+    reflected in the cache key (no stale binary). Pure runtime patch -- no
+    Triton source is modified.
+    """
+    global _run_patched
+    if _run_patched:
+        return
+    from triton.runtime.jit import JITFunction
+
+    _orig_run = JITFunction.run
+
+    def _run(self, *args, **kwargs):
+        if "emit_cuda" not in kwargs:
+            return _orig_run(self, *args, **kwargs)
+        prev = getattr(_tls, "emit_cuda", None)
+        _tls.emit_cuda = bool(kwargs.pop("emit_cuda"))
+        try:
+            return _orig_run(self, *args, **kwargs)
+        finally:
+            _tls.emit_cuda = prev
+
+    JITFunction.run = _run
+    _run_patched = True
+
+
 def register():
-    """Install the hook. Idempotent."""
+    """Install the hook and the ``emit_cuda=`` kwarg patch. Idempotent."""
+    _install_run_patch()
     if knobs.runtime.add_stages_inspection_hook is cuda_stages_hook:
         return
     knobs.runtime.add_stages_inspection_hook = cuda_stages_hook
