@@ -12,3 +12,6 @@ dependencies = []
 [tool.setuptools]
 packages = ["triton_cuda_backend"]
 py-modules = ["_triton_cuda_autoload"]
+
+[tool.setuptools.package-data]
+triton_cuda_backend = ["emit_cuda.so"]

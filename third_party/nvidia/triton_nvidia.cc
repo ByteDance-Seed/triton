@@ -1,5 +1,4 @@
 #include "Dialect/NVGPU/IR/Dialect.h"
-#include "TritonGPUToCUDA/TritonGPUToCUDA.h"
 #include "Dialect/NVWS/IR/Dialect.h"
 #include "NVGPUToLLVM/Passes.h"
 #include "TritonNVIDIAGPUToLLVM/Passes.h"
@@ -149,24 +148,6 @@ void init_triton_nvidia(py::module &&m) {
   init_triton_nvidia_passes_ttgpuir(passes.def_submodule("ttgpuir"));
   init_triton_nvidia_passes_ttnvgpuir(passes.def_submodule("ttnvgpuir"));
   init_triton_hopper_passes(passes.def_submodule("hopper"));
-
-  // CUDA emitter: translate TTGIR -> CUDA C++ source (non-invasive plugin entry)
-  m.def("translate_ttgir_to_cuda",
-        [](mlir::ModuleOp &mod, int32_t capability, int32_t numWarps,
-           int32_t numCtas, int32_t ptxVersion) -> py::dict {
-          auto result = mlir::triton::translateTritonGPUToCUDA(
-              mod, capability, numWarps, numCtas, ptxVersion);
-          if (!result.ok)
-            throw std::runtime_error(result.errorMessage);
-          py::dict ret;
-          ret["cuda_src"] = result.cudaSource;
-          ret["kernel_name"] = result.kernelName;
-          ret["shared_mem_size"] = result.sharedMemSize;
-          ret["global_scratch_size"] = result.globalScratchSize;
-          ret["global_scratch_align"] = result.globalScratchAlign;
-          ret["num_warps"] = result.numWarps;
-          return ret;
-        });
 
   // load dialects
   m.def("load_dialects", [](mlir::MLIRContext &context) {

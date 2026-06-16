@@ -52,11 +52,64 @@ from triton.backends.nvidia.compiler import (
 
 
 def _translate_ttgir_to_cuda(src, capability, options):
-    """Call the C++ emitter exposed on the libtriton ``nvidia`` module."""
-    from triton._C.libtriton import nvidia
+    """Run the emitter as an out-of-tree MLIR pass loaded via TRITON_PLUGIN_PATHS.
+
+    The plugin ABI exposes no new pybind function, and ``ModuleOp`` has no
+    string-attribute getter in the Python bindings, so the ``emit_cuda`` pass
+    hands its results back through a temp file whose path we pass as the 5th
+    pass argument. Requires libtriton built with ``TRITON_EXT_ENABLED=1`` and
+    ``TRITON_PLUGIN_PATHS`` pointing at ``emit_cuda.so``.
+
+    File format (see EmitCudaPlugin.cpp):
+      line 1: "OK" or "ERR"
+      on ERR: remainder = error message
+      on OK:  line 2 = kernel name
+              line 3 = "<shared> <scratchSize> <scratchAlign> <numWarps>"
+              remainder = CUDA C++ source (verbatim)
+    """
+    from triton._C.libtriton import ir, passes
+    if not hasattr(passes, "plugin") or not hasattr(passes.plugin, "emit_cuda"):
+        raise RuntimeError(
+            "emit_cuda plugin pass not registered. Ensure TRITON_PLUGIN_PATHS "
+            "points at emit_cuda.so and libtriton was built with "
+            "TRITON_EXT_ENABLED=1.")
     ptx_version = get_ptx_version_from_options(options, capability)
-    return nvidia.translate_ttgir_to_cuda(
-        src, capability, options.num_warps, options.num_ctas, ptx_version)
+    with tempfile.NamedTemporaryFile(delete=False, mode="r",
+                                     suffix=".cudaresult") as fout:
+        out_path = fout.name
+    try:
+        pm = ir.pass_manager(src.context)
+        args = [str(capability), str(options.num_warps), str(options.num_ctas),
+                str(ptx_version), out_path]
+        passes.plugin.emit_cuda(pm, args)
+        pm.run(src, "emit_cuda")
+        with open(out_path) as f:
+            payload = f.read()
+    finally:
+        if os.path.exists(out_path):
+            os.remove(out_path)
+
+    if not payload:
+        raise RuntimeError("emit_cuda plugin produced no result")
+    status, _, rest = payload.partition("\n")
+    if status == "ERR":
+        raise RuntimeError(rest or "emit_cuda plugin failed")
+    if status != "OK":
+        raise RuntimeError(f"emit_cuda plugin produced malformed result: "
+                           f"{payload[:200]!r}")
+    # line 2 = name, line 3 = sizes, remainder = source body.
+    name_line, _, rest = rest.partition("\n")
+    sizes_line, _, cuda_src = rest.partition("\n")
+    shared, scratch_size, scratch_align, num_warps = (
+        int(x) for x in sizes_line.split())
+    return {
+        "cuda_src": cuda_src,
+        "kernel_name": name_line,
+        "shared_mem_size": shared,
+        "global_scratch_size": scratch_size,
+        "global_scratch_align": scratch_align or 1,
+        "num_warps": num_warps,
+    }
 
 
 def _make_ptx(src, metadata, options, capability):
