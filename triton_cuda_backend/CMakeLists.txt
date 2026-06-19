@@ -53,6 +53,9 @@ endif()
 add_library(emit_cuda MODULE
   csrc/CUDACodeGen.cpp
   csrc/TritonGPUToCUDA.cpp
+  csrc/PersistentTilePass.cpp
+  csrc/EpilogueOverlapPass.cpp
+  csrc/MulticastPass.cpp
   csrc/EmitCudaPlugin.cpp)
 
 target_include_directories(emit_cuda PRIVATE

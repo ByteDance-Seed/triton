@@ -93,3 +93,7 @@ docs/sg_execution_times.rst
 
 # macOS
 .DS_Store
+
+# Local scratch / prototypes and profiler artifacts (not for commit)
+_gap_scratch/
+*.hatchet

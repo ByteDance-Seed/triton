@@ -43,6 +43,18 @@ def _emit_active():
     return os.environ.get("TRITON_EMIT_CUDA", "") == "1"
 
 
+# Per-launch emit_cuda feature flags exposed as kernel kwargs (popped before
+# binding by ``_install_run_patch``). Each maps a kwarg name to its thread-local
+# attribute. These drive the structural IR->IR passes (persistent tile loop,
+# epilogue overlap); the emitter itself stays a pure printer.
+_FEATURE_KWARGS = ("persistent", "epilogue_overlap", "multicast")
+
+
+def _feature_flag(name):
+    """Current per-launch value of a structural feature flag (default False)."""
+    return bool(getattr(_tls, name, False))
+
+
 def _resolve_tool(name):
     """Locate a CUDA toolchain binary (nvcc/ptxas).
 
@@ -101,7 +113,10 @@ def _translate_ttgir_to_cuda(src, capability, options):
     try:
         pm = ir.pass_manager(src.context)
         args = [str(capability), str(options.num_warps), str(options.num_ctas),
-                str(ptx_version), out_path]
+                str(ptx_version), out_path,
+                str(int(_feature_flag("persistent"))),
+                str(int(_feature_flag("epilogue_overlap"))),
+                str(int(_feature_flag("multicast")))]
         passes.plugin.emit_cuda(pm, args)
         pm.run(src, "emit_cuda")
         with open(out_path) as f:
@@ -265,9 +280,14 @@ def cuda_stages_hook(*args):
     We dispatch on ``len(args)``.
     """
     if len(args) == 0:
-        # Cache-keying call. Only differentiate when the emitter is active.
+        # Cache-keying call. Only differentiate when the emitter is active. Fold
+        # the structural feature flags into the key so toggling persistent /
+        # epilogue_overlap never returns a stale binary.
         if _emit_active():
-            return ("cuda-emit-sm90", "cuda-emit-sm90")
+            feats = ",".join(f"{k}={int(_feature_flag(k))}"
+                             for k in _FEATURE_KWARGS)
+            key = f"cuda-emit-sm90;{feats}"
+            return (key, key)
         return ("", "")
 
     # Stage-rewriting call.
@@ -302,15 +322,22 @@ def _install_run_patch():
 
     _orig_run = JITFunction.run
 
+    # All emit_cuda control kwargs popped before signature binding. ``emit_cuda``
+    # toggles the backend; the rest are structural feature flags.
+    _ctrl_kwargs = ("emit_cuda",) + _FEATURE_KWARGS
+
     def _run(self, *args, **kwargs):
-        if "emit_cuda" not in kwargs:
+        present = [k for k in _ctrl_kwargs if k in kwargs]
+        if not present:
             return _orig_run(self, *args, **kwargs)
-        prev = getattr(_tls, "emit_cuda", None)
-        _tls.emit_cuda = bool(kwargs.pop("emit_cuda"))
+        prev = {k: getattr(_tls, k, None) for k in _ctrl_kwargs}
+        for k in present:
+            setattr(_tls, k, bool(kwargs.pop(k)))
         try:
             return _orig_run(self, *args, **kwargs)
         finally:
-            _tls.emit_cuda = prev
+            for k, v in prev.items():
+                setattr(_tls, k, v)
 
     JITFunction.run = _run
     _run_patched = True

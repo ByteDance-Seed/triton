@@ -19,6 +19,7 @@
 //           line 3 = "<shared> <scratchSize> <scratchAlign> <numWarps>"
 //           remainder = CUDA C++ source (kept verbatim, may contain newlines)
 
+#include "Passes.h"
 #include "TritonGPUToCUDA/TritonGPUToCUDA.h"
 #include "triton/Tools/PluginUtils.h"
 
@@ -92,14 +93,32 @@ struct EmitCudaPass
   }
 };
 
-// Parse `[capability, numWarps, numCtas, ptxVersion, outPath]` from the plugin
-// args. Built with -fno-exceptions, so use atoi (no throw) rather than stoi.
+// Parse `[capability, numWarps, numCtas, ptxVersion, outPath, persistent,
+// epilogueOverlap, multicast]` from the plugin args. Built with -fno-exceptions,
+// so use atoi (no throw) rather than stoi. The last three are frontend feature
+// flags (kernel kwargs `persistent=`/`epilogue_overlap=`/`multicast=`, plumbed
+// by _stages.py); "0" or absent means off, so default behavior is
+// byte-identical to before.
 void addEmitCudaPass(PassManager *pm, const std::vector<std::string> &args) {
   int32_t cap = args.size() > 0 ? std::atoi(args[0].c_str()) : 90;
   int32_t nw = args.size() > 1 ? std::atoi(args[1].c_str()) : 4;
   int32_t nc = args.size() > 2 ? std::atoi(args[2].c_str()) : 1;
   int32_t pv = args.size() > 3 ? std::atoi(args[3].c_str()) : 0;
   std::string out = args.size() > 4 ? args[4] : std::string();
+  bool persistent = args.size() > 5 && std::atoi(args[5].c_str()) != 0;
+  bool epilogueOverlap = args.size() > 6 && std::atoi(args[6].c_str()) != 0;
+  bool multicast = args.size() > 7 && std::atoi(args[7].c_str()) != 0;
+
+  // IR->IR structural transforms run BEFORE the emit-cuda lowering pass, so the
+  // emitter only ever prints; all gemm_06-class structure is introduced here.
+  // Gated by frontend flags (not env vars).
+  if (persistent)
+    pm->addPass(triton_cuda::createPersistentTilePass());
+  if (epilogueOverlap)
+    pm->addPass(triton_cuda::createEpilogueOverlapPass());
+  if (multicast)
+    pm->addPass(triton_cuda::createMulticastPass());
+
   pm->addPass(std::make_unique<EmitCudaPass>(cap, nw, nc, pv, std::move(out)));
 }
 

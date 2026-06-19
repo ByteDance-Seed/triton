@@ -1870,6 +1870,13 @@ void CUDACodeGen::emitOp(Operation *op) {
     return emitBarrierExpect(expectOp);
   if (auto invalOp = dyn_cast<ttng::InvalBarrierOp>(op))
     return emitInvalBarrier(invalOp);
+  if (auto fenceClOp =
+          dyn_cast<ttng::FenceMBarrierInitReleaseClusterOp>(op))
+    return emitFenceMBarrierInitReleaseCluster(fenceClOp);
+  if (auto clArriveOp = dyn_cast<ttng::ClusterArriveOp>(op))
+    return emitClusterArrive(clArriveOp);
+  if (auto clWaitOp = dyn_cast<ttng::ClusterWaitOp>(op))
+    return emitClusterWait(clWaitOp);
   if (auto tmaCopyOp = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(op))
     return emitAsyncTMACopyG2L(tmaCopyOp);
   if (auto tmaCopyOp = dyn_cast<ttng::AsyncTMACopyLocalToGlobalOp>(op))
@@ -5743,7 +5750,17 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
       // past the 232448 per-block limit → cuLaunchKernel "invalid argument".
       // Under warp specialization keep per-site static buffers: concurrent
       // partitions at different reduce sites would race one shared floor slot.
+      // The buffer is indexed by the GLOBAL warp_id (`_wb[warp_id]`), which
+      // ranges over ALL totalNumWarps physical warps when the reduction runs in
+      // the warp-specialized region (e.g. a uniform-scalar read in the kernel
+      // body before the partition dispatch — all 12 warps execute it). Sizing it
+      // by effNumWarps (the layout's warpsPerCTA) lets warps beyond that index
+      // write OUT OF BOUNDS, corrupting adjacent shared memory (mbarriers / TMA
+      // buffers) → "unspecified launch failure". Size by totalNumWarps so every
+      // physical warp has its own slot; the read still consumes only the first
+      // effNumWarps slots, which is correct when those warps hold the data.
       bool wbDynamic = (totalNumWarps == numWarps);
+      int wbStaticWarps = std::max(effNumWarps, totalNumWarps);
       int wbOff = 0;
       if (wbDynamic) {
         wbOff = (sharedMemOffset + 15) & ~15;
@@ -5752,7 +5769,7 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
         peakSharedMem = std::max(peakSharedMem, wbOff + numWarps * 8);
       } else {
         emit("__shared__ " + accType + " " + bufName + "[" +
-             std::to_string(effNumWarps) + "];");
+             std::to_string(wbStaticWarps) + "];");
       }
       if (isMultiResult) {
         auto bufName1 = "_wb_" + var1;
@@ -5764,7 +5781,7 @@ void CUDACodeGen::emitReduce(tt::ReduceOp op) {
           peakSharedMem = std::max(peakSharedMem, wbOff1 + numWarps * 8);
         } else {
           emit("__shared__ " + cuda1Type + " " + bufName1 + "[" +
-               std::to_string(effNumWarps) + "];");
+               std::to_string(wbStaticWarps) + "];");
         }
         emit("if (lane_id == 0) { " + bufName + "[warp_id] = " + var + "; " +
              bufName1 + "[warp_id] = " + var1 + "; }");
@@ -7624,8 +7641,14 @@ void CUDACodeGen::emitWarpSpecialize(gpu::WarpSpecializeOp op) {
     int producerThreads = numWarps * 32;
     producerRegs = baseline - (int)(gained / std::max(producerThreads, 1));
     producerRegs &= ~7;
+    // setmaxnreg requires the operand in [24, 256]. The producer issues a .dec,
+    // so it can never sensibly raise above `baseline` (the launch-bounds reg
+    // count); if consumers request FEWER regs than baseline the formula would
+    // overshoot (e.g. 280) and ptxas rejects it. Clamp to the legal range.
     if (producerRegs < 24)
       producerRegs = 24;
+    if (producerRegs > baseline)
+      producerRegs = baseline;
   }
 
   emit("// ─── warp-specialization dispatch (custom Hopper producer/consumer) ───");
@@ -8401,10 +8424,13 @@ void CUDACodeGen::emitLocalAlloc(ttg::LocalAllocOp op) {
         emit("#pragma unroll");
         emit("for (int _i = 0; _i < " + std::to_string(nPacked) + "; _i++) {");
         indent();
-        emit("__half _h0 = (__half)" + srcVar + "[2*_i];");
-        emit("__half _h1 = (__half)" + srcVar + "[2*_i+1];");
-        emit("uint32_t _lo = *(uint16_t*)&_h0;");
-        emit("uint32_t _hi = *(uint16_t*)&_h1;");
+        // Reinterpret the raw 16 bits of each element directly. srcVar already
+        // holds values in the output element type (fp16 or bf16); going through
+        // (__half) would reinterpret bf16 values with the fp16 exponent layout
+        // and corrupt the stmatrix payload (stmatrix.b16 just moves 16-bit
+        // lanes — the bits must already be the destination dtype's bits).
+        emit("uint32_t _lo = *(uint16_t*)&" + srcVar + "[2*_i];");
+        emit("uint32_t _hi = *(uint16_t*)&" + srcVar + "[2*_i+1];");
         emit("_packed[_i] = _lo | (_hi << 16);");
         dedent();
         emit("}");
@@ -11054,13 +11080,36 @@ void CUDACodeGen::emitInitBarrier(ttng::InitBarrierOp op) {
        barVar + ")), \"r\"(" + std::to_string(count) + "));");
   dedent();
   emit("}");
-  blockSync();
+  // Gap B (num_ctas>1): the cooperative cluster TMA multicast has each CTA's TMA
+  // complete_tx land on the PEER CTA's mbarrier (mbarrier.arrive.shared::cluster
+  // / the .multicast::cluster copy). For that remote arrive to be well-defined,
+  // every cluster CTA must have FINISHED initializing its mbarriers and the init
+  // writes must be made visible cluster-wide BEFORE any cross-CTA traffic. Mirror
+  // gemm_06: `fence.mbarrier_init.release.cluster` after init, then a cluster-wide
+  // barrier (barrier.cluster.arrive/wait) instead of the CTA-local __syncthreads.
+  // Init runs once per kernel, so the extra cluster barrier is off the hot path.
+  // num_ctas==1 is byte-identical (keeps the plain CTA blockSync).
+  if (numCtas > 1) {
+    emit("asm volatile(\"fence.mbarrier_init.release.cluster;\" ::: \"memory\");");
+    emit("asm volatile(\"barrier.cluster.arrive;\\nbarrier.cluster.wait;\" ::: "
+         "\"memory\");");
+  } else {
+    blockSync();
+  }
 }
 
 void CUDACodeGen::emitWaitBarrier(ttng::WaitBarrierOp op) {
   auto barVar = getVar(op.getAlloc());
   auto phaseVar = getVar(op.getPhase());
-  blockSync();
+  // EXPERIMENT (env-gated, default off -> byte-identical): inside a WS partition
+  // the pre-wait bar.sync is redundant for an mbarrier consumer wait — the
+  // try_wait.parity spin is itself the acquire fence and the producer/consumer
+  // mbarrier protocol already orders smem. gemm_06's math loop has no per-K-iter
+  // sync. Skipping it removes one named-barrier per K-iter from the hot loop.
+  static const bool leanWsSync = (getenv("TRITON_WS_LEAN_SYNC") != nullptr) &&
+                                 (std::string(getenv("TRITON_WS_LEAN_SYNC")) == "1");
+  if (!(leanWsSync && wsSyncBarrierId > 0))
+    blockSync();
   emit("{");
   indent();
   emit("unsigned _mbar_addr = (unsigned)__cvta_generic_to_shared(" + barVar + ");");
@@ -11080,8 +11129,79 @@ void CUDACodeGen::emitWaitBarrier(ttng::WaitBarrierOp op) {
 
 void CUDACodeGen::emitArriveBarrier(ttng::ArriveBarrierOp op) {
   auto barVar = getVar(op.getAlloc());
-  emit("asm volatile(\"mbarrier.arrive.shared::cta.b64 _, [%0];\" :: \"r\"((unsigned)__cvta_generic_to_shared(" +
-       barVar + ")));");
+  // mbarrier.arrive decrements the pending-arrival count by exactly `count`,
+  // so it must be issued by a SINGLE thread — not once per thread in the
+  // warp(group). Stock Triton (ArriveBarrierOpConversion) elects thread 0 via
+  // `@(threadId==0)` and appends the count only when >1. We mirror that using
+  // the partition-local `tid` that emitWarpSpecialize shadows (so each WS
+  // consumer region elects its own first thread); in non-WS code `tid` is the
+  // raw threadIdx.x, electing global thread 0. Issuing it unguarded over an
+  // N-thread warpgroup over-arrives an init-count-1 barrier and corrupts its
+  // phase ("Barrier error: missing wait").
+  std::string pred = "tid == 0";
+  if (op.getPred())
+    pred += " && (" + getVar(op.getPred()) + ")";
+  uint32_t count = op.getCount();
+
+  // Gap B: cluster-broadcast empty arrive. When the barrier's shared tile is
+  // REPLICATED across a subset of cluster CTAs (free in its layout's kBlock
+  // input, i.e. allocated with a replicated cga_layout) the arrive must reach
+  // EVERY CTA's copy of the barrier — not just the local one. In a cluster GEMM
+  // the representative CTA delivers the multicast operand into all peers' smem
+  // and may only recycle that slot once ALL peers' consumers have released it;
+  // a CTA-local arrive would let the representative overwrite a peer's still-live
+  // buffer (corruption / phase desync / deadlock). Mirrors the stock pipeliner's
+  // cluster-broadcast empty arrives. Each consumer maps the barrier address into
+  // every peer of its broadcast group (mapa.shared::cluster) and issues a remote
+  // mbarrier.arrive.shared::cluster; the barrier's init count must therefore be
+  // scaled by the number of arriving CTAs.
+  uint32_t bcastMask = 0;
+  if (numCtas > 1) {
+    if (auto barTy = dyn_cast<ttg::MemDescType>(op.getAlloc().getType())) {
+      auto *ctx = barTy.getContext();
+      auto kBlock = mlir::StringAttr::get(ctx, "block");
+      bcastMask = ttg::toLinearLayout(barTy).getFreeVariableMasks().lookup(
+                      kBlock) &
+                  (numCtas - 1);
+    }
+  }
+
+  // CUDA inline asm has no portable predicate-register constraint, so guard the
+  // single-thread arrival with a C++ `if` (the same idiom emit uses for the
+  // producer's expect_tx) rather than a PTX `@p` predicate operand.
+  emit("if (" + pred + ") {");
+  indent();
+  if (bcastMask != 0) {
+    uint32_t fixedMask = (~bcastMask) & (numCtas - 1);
+    std::string cnt = count > 1 ? (", " + std::to_string(count)) : "";
+    emit("unsigned _ba = (unsigned)__cvta_generic_to_shared(" + barVar + ");");
+    emit("for (unsigned _cta = 0u; _cta < " + std::to_string(numCtas) +
+         "u; ++_cta) {");
+    indent();
+    emit("if ((_cta & " + std::to_string(fixedMask) + "u) == (_cta_rank & " +
+         std::to_string(fixedMask) + "u)) {");
+    indent();
+    emit("unsigned _rb;");
+    emit("asm volatile(\"mapa.shared::cluster.u32 %0, %1, %2;\" : \"=r\"(_rb) "
+         ": \"r\"(_ba), \"r\"(_cta));");
+    emit("asm volatile(\"mbarrier.arrive.shared::cluster.b64 _, [%0]" + cnt +
+         ";\" :: \"r\"(_rb)" + (count > 1 ? (", \"n\"(" + std::to_string(count) +
+                                            ")")
+                                         : std::string()) +
+         ");");
+    dedent();
+    emit("}");
+    dedent();
+    emit("}");
+  } else if (count > 1)
+    emit("asm volatile(\"mbarrier.arrive.shared::cta.b64 _, [%0], %1;\" :: "
+         "\"r\"((unsigned)__cvta_generic_to_shared(" + barVar + ")), \"n\"(" +
+         std::to_string(count) + "));");
+  else
+    emit("asm volatile(\"mbarrier.arrive.shared::cta.b64 _, [%0];\" :: "
+         "\"r\"((unsigned)__cvta_generic_to_shared(" + barVar + ")));");
+  dedent();
+  emit("}");
 }
 
 void CUDACodeGen::emitBarrierExpect(ttng::BarrierExpectOp op) {
@@ -11106,6 +11226,28 @@ void CUDACodeGen::emitInvalBarrier(ttng::InvalBarrierOp op) {
   emit("if (threadIdx.x == 0)");
   emit("    asm volatile(\"mbarrier.inval.shared::cta.b64 [%0];\" :: \"r\"((unsigned)__cvta_generic_to_shared(" +
        barVar + ")));");
+}
+
+// gluon mbarrier.sync_cluster_init() lowers to three standalone ops:
+// fence_mbarrier_init_release_cluster, cluster_arrive(relaxed), cluster_wait.
+// They make every cluster CTA's mbarrier-init writes visible cluster-wide before
+// any cross-CTA TMA multicast traffic (whose complete_tx lands on PEER mbarriers).
+// All threads must execute the cluster barrier (it is a CTA-wide rendezvous that
+// also synchronizes across the cluster), so these are emitted unguarded.
+void CUDACodeGen::emitFenceMBarrierInitReleaseCluster(
+    ttng::FenceMBarrierInitReleaseClusterOp op) {
+  emit("asm volatile(\"fence.mbarrier_init.release.cluster;\" ::: \"memory\");");
+}
+
+void CUDACodeGen::emitClusterArrive(ttng::ClusterArriveOp op) {
+  if (op.getRelaxed())
+    emit("asm volatile(\"barrier.cluster.arrive.relaxed;\" ::: \"memory\");");
+  else
+    emit("asm volatile(\"barrier.cluster.arrive;\" ::: \"memory\");");
+}
+
+void CUDACodeGen::emitClusterWait(ttng::ClusterWaitOp op) {
+  emit("asm volatile(\"barrier.cluster.wait;\" ::: \"memory\");");
 }
 
 // Compute the per-copy plan for a TMA global<->local transfer of a swizzled
@@ -11175,6 +11317,16 @@ TMACopyPlan CUDACodeGen::computeTMACopyPlan(ttg::MemDescType smemTy,
             perDim[d] = off[k].second - base[k].second;
       plan.blockCoordDelta.push_back(perDim);
     }
+    // CGA multicast candidate: bits of the cluster CTA rank over which the
+    // destination smem tile is REPLICATED (free in smemLayout's kBlock input).
+    // Mirrors the reference AsyncTMACopyGlobalToLocalOpConversion:
+    //   maskCGABroadcast = smemLayout.getFreeVariableMasks().lookup(kBlock).
+    // A nonzero mask means the same shared tile is delivered to several CTAs and
+    // the TMA may be issued once with .multicast::cluster.
+    plan.numCTAs = numCtas;
+    if (numCtas > 1)
+      plan.cgaBroadcastMask =
+          smemLayout.getFreeVariableMasks().lookup(kBlock) & (numCtas - 1);
   } else {
     plan.shMemElemOffset.push_back(0);
     plan.coordOff.push_back(SmallVector<int>(coordRank, 0));
@@ -11201,16 +11353,105 @@ void CUDACodeGen::emitAsyncTMACopyG2L(ttng::AsyncTMACopyGlobalToLocalOp op) {
   auto smemTy = cast<ttg::MemDescType>(op.getResult().getType());
   TMACopyPlan plan = computeTMACopyPlan(smemTy, rank);
 
+  // Gap A: cluster TMA multicast. When the IR marks this copy as multicast AND
+  // the destination smem tile is replicated across a subset of cluster CTAs
+  // (cgaBroadcastMask != 0), a single CTA — the representative (lowest-id) CTA
+  // of each multicast group — issues one cp.async.bulk...multicast::cluster that
+  // delivers the tile to every CTA in the group and signals each CTA's mbarrier.
+  // Non-representative CTAs are predicated out, eliminating the redundant
+  // per-CTA loads of replicated operands (e.g. A in a row-split cluster GEMM).
+  // Mirrors AsyncTMACopyGlobalToLocalOpConversion + createTMAMulticastMask.
+  //
+  // NOTE: the stock pipeliner (LowerLoops::createTMAAsyncLoad) builds these ops
+  // with multicast=false for descriptor-load GEMMs, so neither stock-PTX nor a
+  // naive emit ever multicasts replicated operands — every CTA redundantly loads
+  // them. When the destination tile is replicated (cgaBroadcastMask != 0) a
+  // single representative CTA can deliver it to the whole group with one
+  // .multicast::cluster message, halving the replicated operand's global
+  // traffic. That is correct ONLY if the cluster marches the producer/consumer
+  // pipeline in lockstep: the representative's complete_tx lands on REMOTE CTAs'
+  // mbarriers at a fixed smem offset, so every group CTA must already have run
+  // its expect_tx and be on the matching pipeline phase. emit's current pipeline
+  // only has a CTA-local __syncthreads() — no cluster.arrive/wait — so CTAs run
+  // asynchronously and the cross-CTA expect_tx/complete_tx ordering races,
+  // underflowing the tx count and DEADLOCKING under sustained launches. Until
+  // the pipeline gains cluster-scoped barriers (Gap B), multicast is opt-in via
+  // TRITON_EMIT_MULTICAST=1 so the default path stays deadlock-free. Measured:
+  // even when it does not hang, multicast was ~3% slower than the redundant-load
+  // baseline for square num_ctas=2 GEMMs (compute-bound; the representative-only
+  // issue serializes the load that two CTAs otherwise fetch in parallel).
+  // Honor the IR's PER-OP multicast attribute. The frontend marks ONLY genuinely
+  // cluster-replicated operands — whose global coords are cta-rank-INDEPENDENT
+  // (e.g. B in a row-split GEMM: off_n = pid_n*BLOCK_N, same on every CTA) — with
+  // multicast=true. Gating on the smem layout's cgaBroadcastMask ALONE is wrong:
+  // a per-CTA operand (e.g. A, whose global row off_m = ... + cta_rank*CTA_M
+  // depends on _cta_rank) can share a replicated smem LAYOUT yet must NOT be
+  // multicast — the representative CTA would deliver its OWN rows to all peers
+  // (observed: err≈501 on ws_v8). cgaBroadcastMask stays a necessary condition
+  // (the destination tile must actually be replicated for one message to reach
+  // all peers). The op's multicast attribute — set by the frontend cluster/TMA
+  // descriptor setup — is the sole signal; there is no env-var override.
+  bool multicast = op.getMulticast() && plan.cgaBroadcastMask != 0;
+  // P3 MulticastPass tags rank-DEPENDENT loads that the frontend nonetheless
+  // marked multicast as `cooperative`: each CTA issues its OWN half-tile load
+  // (off_n + cta_rank*HALF_N) and broadcasts it to all peers, so after every
+  // CTA's load each holds the full tile (gemm_06 cooperative split). For these
+  // we must NOT representative-gate (every CTA issues), but we DO keep the
+  // .multicast::cluster + _mc_mask so the broadcast still reaches all peers.
+  bool cooperative = multicast && op->hasAttr("cooperative");
+  uint32_t mcPattern = 1, mcFixedBits = 0;
+  if (multicast) {
+    uint32_t broadcastBits = plan.cgaBroadcastMask;
+    int blockBits = llvm::Log2_32(plan.numCTAs);
+    mcFixedBits = (~broadcastBits) & (plan.numCTAs - 1);
+    for (int i = 0; i < blockBits; ++i)
+      if ((mcFixedBits & (1u << i)) == 0)
+        mcPattern |= (mcPattern << (1u << i));
+  }
+
   // No blockSync here: an async_tma_copy is always preceded by a barrier_expect
   // (which emits the buffer-free blockSync before its expect_tx). The expect_tx
   // and this cp.async.bulk are both issued by thread 0 and ordered within that
   // thread, so a second CTA-wide barrier between them is redundant. Dropping it
   // halves the per-iteration TMA barriers (K+V: 4 -> 2).
+  // COOPERATIVE SPLIT (gemm_06 lines 695-707): when a replicated operand's tile
+  // is multicast and decomposes into numCopies TMA boxes evenly divisible by the
+  // cluster size, DON'T have one representative CTA issue every box (which idles
+  // the peer CTAs' TMA engines and serializes the DRAM read). Instead partition
+  // the boxes: CTA r issues boxes [r*copiesPerCta, (r+1)*copiesPerCta), each with
+  // .multicast::cluster + full mc_mask so every box still lands in EVERY CTA's
+  // smem at its own (issuer-independent) offset. Net: both TMA engines read in
+  // parallel, total B DRAM traffic = 1x, single contiguous buffer => one wide
+  // WGMMA. expect_tx stays the FULL tile on each CTA's barrier (self boxes via
+  // own multicast + peer boxes via peer multicast). Falls back to representative
+  // broadcast when the box count is not cluster-divisible.
+  bool coopSplit = multicast && plan.numCTAs > 1 &&
+                   plan.numCopies >= (int)plan.numCTAs &&
+                   (plan.numCopies % (int)plan.numCTAs == 0);
+  int copiesPerCta = coopSplit ? plan.numCopies / (int)plan.numCTAs : 0;
+
   emit("if (threadIdx.x == 0) {");
   indent();
-  emit("if (" + predVar + ") {");
+  std::string copyPred = predVar;
+  if (multicast) {
+    if (!coopSplit && !cooperative) {
+      // Only the representative CTA of each multicast group issues the copy.
+      copyPred = "(" + predVar + ") && ((_cta_rank & " +
+                 std::to_string(plan.cgaBroadcastMask) + "u) == 0)";
+    }
+    emit("unsigned _mc_mask = " + std::to_string(mcPattern) +
+         "u << (_cta_rank & " + std::to_string(mcFixedBits) + "u);");
+  }
+  emit("if (" + copyPred + ") {");
   indent();
   for (int c = 0; c < plan.numCopies; c++) {
+    // Cooperative: box c is owned (issued) by exactly one CTA; the peers receive
+    // it via multicast. owner is a compile-time constant per box.
+    if (coopSplit) {
+      int owner = c / copiesPerCta;
+      emit("if (_cta_rank == " + std::to_string(owner) + "u) {");
+      indent();
+    }
     std::string smemOff = (plan.shMemElemOffset[c] == 0)
                               ? ""
                               : " + " + std::to_string(plan.shMemElemOffset[c]);
@@ -11240,18 +11481,32 @@ void CUDACodeGen::emitAsyncTMACopyG2L(ttng::AsyncTMACopyGlobalToLocalOp op) {
       if (i != rank - 1)
         braceList += ", ";
     }
+    std::string mcSuffix = multicast ? ".multicast::cluster" : "";
+    std::string mcOperand =
+        multicast ? (", %" + std::to_string(rank + 3)) : "";
     emit("asm volatile(");
     emit("    \"cp.async.bulk.tensor." + std::to_string(rank) +
-         "d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], "
-         "[%1, {" +
-         braceList + "}], [%" + std::to_string(rank + 2) + "];\\n\"");
+         "d.shared::cluster.global.tile.mbarrier::complete_tx::bytes" +
+         mcSuffix + " [%0], "
+                    "[%1, {" +
+         braceList + "}], [%" + std::to_string(rank + 2) + "]" + mcOperand +
+         ";\\n\"");
     emit("    :: \"r\"((unsigned)__cvta_generic_to_shared(" + smemVar + smemOff +
          ")),");
     emit("       \"l\"(" + descAddr + "),");
     for (int i = 0; i < rank; i++)
       emit("       \"r\"(" + coordOps[i] + "),");
-    emit("       \"r\"((unsigned)__cvta_generic_to_shared(" + barVar + "))");
+    if (multicast)
+      emit("       \"r\"((unsigned)__cvta_generic_to_shared(" + barVar + ")),");
+    else
+      emit("       \"r\"((unsigned)__cvta_generic_to_shared(" + barVar + "))");
+    if (multicast)
+      emit("       \"h\"((unsigned short)_mc_mask)");
     emit(");");
+    if (coopSplit) {
+      dedent();
+      emit("}");
+    }
   }
   dedent();
   emit("}");

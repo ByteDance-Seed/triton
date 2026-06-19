@@ -42,6 +42,13 @@ struct TMACopyPlan {
   // CGA: per cluster-CTA-rank bit, the per-smem-dim global coordinate delta
   // (CTASplitNum slicing, mirrors msgToOffset's kBlock input). Empty for 1 CTA.
   llvm::SmallVector<llvm::SmallVector<int>> blockCoordDelta;
+  // CGA multicast: bitmask of cluster-CTA-rank bits over which the destination
+  // smem tile is REPLICATED (free in the smem LinearLayout's kBlock input).
+  // Nonzero => the tile is broadcast to several CTAs and the TMA can be issued
+  // once with .multicast::cluster. Mirrors the reference lowering's
+  // maskCGABroadcast = smemLayout.getFreeVariableMasks().lookup(kBlock).
+  uint32_t cgaBroadcastMask = 0;
+  int numCTAs = 1;
 };
 
 class CUDACodeGen {
@@ -201,6 +208,10 @@ private:
   void emitArriveBarrier(nvidia_gpu::ArriveBarrierOp op);
   void emitBarrierExpect(nvidia_gpu::BarrierExpectOp op);
   void emitInvalBarrier(nvidia_gpu::InvalBarrierOp op);
+  void emitFenceMBarrierInitReleaseCluster(
+      nvidia_gpu::FenceMBarrierInitReleaseClusterOp op);
+  void emitClusterArrive(nvidia_gpu::ClusterArriveOp op);
+  void emitClusterWait(nvidia_gpu::ClusterWaitOp op);
   TMACopyPlan computeTMACopyPlan(gpu::MemDescType smemTy, int coordRank);
   void emitAsyncTMACopyG2L(nvidia_gpu::AsyncTMACopyGlobalToLocalOp op);
   void emitAsyncTMACopyL2G(nvidia_gpu::AsyncTMACopyLocalToGlobalOp op);
