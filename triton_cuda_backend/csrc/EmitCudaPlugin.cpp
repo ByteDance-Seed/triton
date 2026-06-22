@@ -94,11 +94,12 @@ struct EmitCudaPass
 };
 
 // Parse `[capability, numWarps, numCtas, ptxVersion, outPath, persistent,
-// epilogueOverlap, multicast]` from the plugin args. Built with -fno-exceptions,
-// so use atoi (no throw) rather than stoi. The last three are frontend feature
-// flags (kernel kwargs `persistent=`/`epilogue_overlap=`/`multicast=`, plumbed
-// by _stages.py); "0" or absent means off, so default behavior is
-// byte-identical to before.
+// epilogueOverlap, multicast, wgPingpong]` from the plugin args. Built with
+// -fno-exceptions, so use atoi (no throw) rather than stoi. The last four are
+// frontend feature flags (kernel kwargs
+// `persistent=`/`epilogue_overlap=`/`multicast=`/`wg_pingpong=`, plumbed by
+// _stages.py); "0" or absent means off, so default behavior is byte-identical
+// to before.
 void addEmitCudaPass(PassManager *pm, const std::vector<std::string> &args) {
   int32_t cap = args.size() > 0 ? std::atoi(args[0].c_str()) : 90;
   int32_t nw = args.size() > 1 ? std::atoi(args[1].c_str()) : 4;
@@ -108,6 +109,7 @@ void addEmitCudaPass(PassManager *pm, const std::vector<std::string> &args) {
   bool persistent = args.size() > 5 && std::atoi(args[5].c_str()) != 0;
   bool epilogueOverlap = args.size() > 6 && std::atoi(args[6].c_str()) != 0;
   bool multicast = args.size() > 7 && std::atoi(args[7].c_str()) != 0;
+  bool wgPingpong = args.size() > 8 && std::atoi(args[8].c_str()) != 0;
 
   // IR->IR structural transforms run BEFORE the emit-cuda lowering pass, so the
   // emitter only ever prints; all gemm_06-class structure is introduced here.
@@ -118,6 +120,13 @@ void addEmitCudaPass(PassManager *pm, const std::vector<std::string> &args) {
     pm->addPass(triton_cuda::createEpilogueOverlapPass());
   if (multicast)
     pm->addPass(triton_cuda::createMulticastPass());
+  if (wgPingpong) {
+    // The ping-pong pass inserts unregistered emitcuda.named_barrier ops. Enable
+    // unregistered dialects on the context NOW (pass-build time is
+    // single-threaded); it cannot be toggled once the pass manager is running.
+    pm->getContext()->allowUnregisteredDialects(true);
+    pm->addPass(triton_cuda::createWgPingpongPass());
+  }
 
   pm->addPass(std::make_unique<EmitCudaPass>(cap, nw, nc, pv, std::move(out)));
 }

@@ -31,6 +31,14 @@ std::unique_ptr<mlir::Pass> createEpilogueOverlapPass();
 // (one load serves all CTAs of the CGA). No-op on non-cluster kernels.
 std::unique_ptr<mlir::Pass> createMulticastPass();
 
+// P4: inter-warpgroup ping-pong scheduling for the 2-consumer FlashAttention
+// mainloop. Inserts emitcuda.named_barrier ops (bar.sync/bar.arrive on private
+// scheduler barrier IDs) so the two consumer warpgroups stagger: one WG's
+// softmax (CUDA cores) overlaps the other's WGMMA (tensor cores). Mirrors
+// level6's warp_scheduler_barrier_sync/arrive. Only fires on a warp_specialize
+// with exactly 2 consumer partitions whose mainloop has >=2 WGMMA dots.
+std::unique_ptr<mlir::Pass> createWgPingpongPass();
+
 } // namespace triton_cuda
 
 #endif // TRITON_CUDA_BACKEND_PASSES_H

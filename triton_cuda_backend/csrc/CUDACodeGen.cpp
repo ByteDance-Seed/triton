@@ -1100,9 +1100,12 @@ void CUDACodeGen::emitOp(Operation *op) {
   if (auto selectOp = dyn_cast<arith::SelectOp>(op))
     return emitArithSelect(selectOp);
 
-  // Math ops
-  if (op->getDialect()->getNamespace() == "math")
-    return emitMathOp(op);
+  // Math ops. Guard getDialect(): it is null for unregistered ops (e.g. the
+  // emitcuda.named_barrier ops inserted by WgPingpongPass), so an unguarded
+  // deref here would fault before those ops reach their own dispatch below.
+  if (Dialect *d = op->getDialect())
+    if (d->getNamespace() == "math")
+      return emitMathOp(op);
 
   // Precise (round-to-nearest) float ops. tl.math.sqrt_rn / div_rn lower to
   // tt.precise_sqrt / tt.precise_divf. These need the IEEE round-to-nearest
@@ -1852,6 +1855,11 @@ void CUDACodeGen::emitOp(Operation *op) {
   // ever reach it via normal dispatch it carries no standalone semantics.
   if (isa<ttg::WarpSpecializePartitionsOp>(op))
     return;
+
+  // emitcuda.named_barrier — unregistered op inserted by WgPingpongPass to
+  // realize level6's inter-warpgroup ping-pong (bar.sync/bar.arrive %id,%n).
+  if (op->getName().getStringRef() == "emitcuda.named_barrier")
+    return emitNamedBarrier(op);
 
   // NVGPUIR ops (sm90a)
   if (auto wgDotOp = dyn_cast<ttng::WarpGroupDotOp>(op))
@@ -7333,12 +7341,19 @@ void CUDACodeGen::emitAtomicRMW(tt::AtomicRMWOp op) {
     dedent();
     emit("}");
     if (used) {
-      // Broadcast thread 0's old value to the whole CTA. The trailing barrier
-      // keeps the next emission's store to the scratch (e.g. the following
-      // spin-loop iteration) from racing slow readers of this one.
-      emit("__syncthreads();");
+      // Broadcast thread 0's old value to the rest of the threads sharing this
+      // atomic. The trailing barrier keeps the next emission's store to the
+      // scratch (e.g. the following spin-loop iteration) from racing slow
+      // readers of this one. Route through blockSync() instead of a hard
+      // __syncthreads(): inside a ttg.warp_specialize partition the consumer
+      // warps take a different branch and never reach a CTA-wide barrier, so a
+      // raw __syncthreads() in the producer region deadlocks. blockSync()
+      // lowers to a region-scoped `bar.sync <regionId>, <regionThreads>` when
+      // emitting inside a WS region (matching level6's warp-local scheduler
+      // broadcast) and to __syncthreads() in ordinary code.
+      blockSync();
       emit(var + " = " + var + "_bc;");
-      emit("__syncthreads();");
+      blockSync();
     }
   }
 }
@@ -10476,12 +10491,26 @@ void CUDACodeGen::emitWarpGroupDot(ttng::WarpGroupDotOp op) {
     int swizzle_a = 128;
     bool a_is_transposed = false;
     int a_shape1 = K_block;
+    // Physical leading dim of the A shared allocation. For a row-sliced sub-tile
+    // (e.g. q_smem.slice(0,64) of a [128,128] buffer) the swizzle atoms are still
+    // strided by the PARENT row count, not the sliced M. Using the logical M_block
+    // here makes the descriptor's leadDimensionBaseOffset and the cross-atom K jump
+    // too small (8192 vs 16384 @ BK=128), so k-steps past the first swizzle atom
+    // read the wrong rows. Derive it from getAllocShape (matches the local_load
+    // subview-stride convention at the non-swizzled path above).
+    int a_lead_block = M_block;
     {
       auto aMemDesc = cast<ttg::MemDescType>(a.getType());
       auto aEnc = dyn_cast<ttg::NVMMASharedEncodingAttr>(aMemDesc.getEncoding());
       swizzle_a = aEnc ? aEnc.getSwizzlingByteWidth() : 64;
       a_is_transposed = aEnc && aEnc.getTransposed();
       a_shape1 = aMemDesc.getShape()[1];
+      int aRank = (int)aMemDesc.getShape().size();
+      auto aAllocShape = aMemDesc.getAllocShape().take_back(aRank);
+      auto aAllocPerCTA = ttg::getShapePerCTA(aMemDesc.getEncoding(), aAllocShape);
+      a_lead_block = aAllocPerCTA[0];
+      if (a_is_transposed)
+        a_shape1 = aAllocPerCTA[1];
     }
     // Transposed (M-contiguous) A in SS mode requires the imm-trans-a flag,
     // which only exists for 16-bit wgmma. The pipeline normalizes int8/fp8/
@@ -10533,7 +10562,7 @@ void CUDACodeGen::emitWarpGroupDot(ttng::WarpGroupDotOp op) {
     // advancing one wgmma_m tile crosses (wgmma_m/eRow_a) swizzle atoms of
     // (a_stride_dim*eRow_a) elements each. wgmma_m=64 is a multiple of eRow_a
     // (16/32/64), so the within-atom remainder is always 0.
-    int a_stride_dim = a_is_transposed ? a_shape1 : M_block;
+    int a_stride_dim = a_is_transposed ? a_shape1 : a_lead_block;
     int a_m_stride = a_is_transposed
                          ? wgmma_m * a_stride_dim * elem_bytes_a
                          : wgmma_m * eRow_a * elem_bytes_a;
@@ -10574,7 +10603,7 @@ void CUDACodeGen::emitWarpGroupDot(ttng::WarpGroupDotOp op) {
         // Transposed A: K is the stride (row) dim, each row is eRow_a elems.
         int a_k_offset = a_is_transposed
                              ? a_k_elem * eRow_a * elem_bytes_a
-                             : ((a_k_elem / eRow_a) * (M_block * eRow_a) +
+                             : ((a_k_elem / eRow_a) * (a_lead_block * eRow_a) +
                                 (a_k_elem % eRow_a)) * elem_bytes_a;
         int b_byte_offset;
         if (b_is_transposed) {
@@ -11061,6 +11090,28 @@ void CUDACodeGen::emitWarpGroupDotWait(ttng::WarpGroupDotWaitOp op) {
     blockSync();
   }
 }
+
+// emitcuda.named_barrier — inserted by WgPingpongPass to realize level6's
+// inter-warpgroup ping-pong scheduling. Attributes:
+//   barrier_id : i32  — PTX named-barrier index (0..15)
+//   num_threads: i32  — number of threads participating in the barrier
+//   is_arrive  : bool — true => bar.arrive (non-blocking), false => bar.sync
+// bar.arrive lets a warpgroup signal the *other* warpgroup's barrier without
+// blocking; bar.sync blocks until num_threads have arrived. Together two
+// consumer warpgroups stagger so one's softmax (CUDA cores) overlaps the
+// other's WGMMA (tensor cores).
+void CUDACodeGen::emitNamedBarrier(mlir::Operation *op) {
+  auto idAttr = op->getAttrOfType<mlir::IntegerAttr>("barrier_id");
+  auto ntAttr = op->getAttrOfType<mlir::IntegerAttr>("num_threads");
+  auto arriveAttr = op->getAttrOfType<mlir::BoolAttr>("is_arrive");
+  int barId = idAttr ? (int)idAttr.getInt() : 0;
+  int numThreads = ntAttr ? (int)ntAttr.getInt() : 0;
+  bool isArrive = arriveAttr ? arriveAttr.getValue() : false;
+  const char *opcode = isArrive ? "bar.arrive" : "bar.sync";
+  emit("asm volatile(\"" + std::string(opcode) + " " +
+       std::to_string(barId) + ", " + std::to_string(numThreads) + ";\");");
+}
+
 void CUDACodeGen::emitFenceAsyncShared(ttng::FenceAsyncSharedOp op) {
   if (hasPendingCpAsync) {
     emit("asm volatile(\"cp.async.commit_group;\");");

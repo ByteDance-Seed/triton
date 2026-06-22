@@ -56,6 +56,7 @@ add_library(emit_cuda MODULE
   csrc/PersistentTilePass.cpp
   csrc/EpilogueOverlapPass.cpp
   csrc/MulticastPass.cpp
+  csrc/WgPingpongPass.cpp
   csrc/EmitCudaPlugin.cpp)
 
 target_include_directories(emit_cuda PRIVATE

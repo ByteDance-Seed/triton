@@ -47,7 +47,7 @@ def _emit_active():
 # binding by ``_install_run_patch``). Each maps a kwarg name to its thread-local
 # attribute. These drive the structural IR->IR passes (persistent tile loop,
 # epilogue overlap); the emitter itself stays a pure printer.
-_FEATURE_KWARGS = ("persistent", "epilogue_overlap", "multicast")
+_FEATURE_KWARGS = ("persistent", "epilogue_overlap", "multicast", "wg_pingpong")
 
 
 def _feature_flag(name):
@@ -116,7 +116,8 @@ def _translate_ttgir_to_cuda(src, capability, options):
                 str(ptx_version), out_path,
                 str(int(_feature_flag("persistent"))),
                 str(int(_feature_flag("epilogue_overlap"))),
-                str(int(_feature_flag("multicast")))]
+                str(int(_feature_flag("multicast"))),
+                str(int(_feature_flag("wg_pingpong")))]
         passes.plugin.emit_cuda(pm, args)
         pm.run(src, "emit_cuda")
         with open(out_path) as f:

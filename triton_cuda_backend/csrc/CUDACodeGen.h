@@ -202,6 +202,7 @@ private:
   // ── Per-op emitters (NVGPUIR / sm90a) ─────────────────────────────
   void emitWarpGroupDot(nvidia_gpu::WarpGroupDotOp op);
   void emitWarpGroupDotWait(nvidia_gpu::WarpGroupDotWaitOp op);
+  void emitNamedBarrier(mlir::Operation *op);
   void emitFenceAsyncShared(nvidia_gpu::FenceAsyncSharedOp op);
   void emitInitBarrier(nvidia_gpu::InitBarrierOp op);
   void emitWaitBarrier(nvidia_gpu::WaitBarrierOp op);
