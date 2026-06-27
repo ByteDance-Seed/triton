@@ -347,6 +347,12 @@ def _install_run_patch():
 def register():
     """Install the hook and the ``emit_cuda=`` kwarg patch. Idempotent."""
     _install_run_patch()
+    # Inject Python-only Gluon builtins (keeps the Triton source tree pristine).
+    try:
+        from ._gluon_ext import inject_async_reduce_shared_to_global
+        inject_async_reduce_shared_to_global()
+    except Exception:
+        pass
     if knobs.runtime.add_stages_inspection_hook is cuda_stages_hook:
         return
     knobs.runtime.add_stages_inspection_hook = cuda_stages_hook

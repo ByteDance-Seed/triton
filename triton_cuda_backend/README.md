@@ -44,6 +44,13 @@ The plugin links against `libtriton.so`, so libtriton **must** be built with
 `TRITON_EXT_ENABLED=1` (this gives its MLIR symbols default visibility so the
 plugin can resolve them at `dlopen`).
 
+> **`TRITON_EXT_ENABLED` is a build-time flag, NOT a source modification.** It only
+> flips symbol visibility (`-fvisibility=default` for the MLIR/LLVM symbols) so an
+> out-of-tree `dlopen`'d plugin can resolve them; it changes **zero** lines of Triton
+> source. Build a *pristine* Triton checkout with this flag set — `git status` stays
+> clean. The flag is upstream Triton's own (it exists precisely to support external
+> plugins like this one).
+
 ```bash
 cd $TRITON_ROOT
 TRITON_EXT_ENABLED=1 \
@@ -82,6 +89,27 @@ cd $TRITON_ROOT/triton_cuda_backend
 python3 -m pip install --force-reinstall --no-deps --no-build-isolation .
 rm -rf ~/.triton/cache   # always clear the kernel cache after a rebuild
 ```
+
+---
+
+## Non-invasive guarantee (zero Triton source edits)
+
+The Triton source tree stays **pristine** — `git status` under `lib/` and
+`python/triton/` is clean. Everything this backend needs lives out-of-tree in
+`triton_cuda_backend/`:
+
+| Coupling to Triton | How (no source patch) |
+| --- | --- |
+| Route sm90 kernels to the CUDA emitter | official `knobs.runtime.add_stages_inspection_hook` (set in `_stages.py`) |
+| `emit_cuda=True` per-launch kwarg | runtime wrap of `JITFunction.run` (pops the kwarg before binding); overrides the `TRITON_EMIT_CUDA` env var |
+| The emitter itself | `emit_cuda.so`, loaded via Triton's official plugin ABI (`TRITON_PLUGIN_PATHS` / `tritonGetPluginInfo`) |
+| Symbol resolution for that `.so` | `TRITON_EXT_ENABLED=1` **build flag** (visibility only — see above) |
+| Extra Gluon builtins (e.g. `tma.async_reduce_shared_to_global`) | injected at `import` by `_gluon_ext.py` (monkeypatch onto the gluon `tma` module); wraps **pristine** upstream bindings (`create_async_tma_reduce`, `DESCRIPTOR_REDUCE_KIND`, `AsyncTMAReduceOp`), so **no libtriton rebuild** for these |
+
+There are **no** edits to Triton's MLIR passes, dialects, verifiers, or Python
+source. (The tutorials use only power-of-2 WGMMA tiles, so no pow2-constraint
+relaxation is needed; native non-pow2 WGMMA N=80 is the one capability that would
+require a core C++ patch, and the shipped tutorials don't use it.)
 
 ---
 

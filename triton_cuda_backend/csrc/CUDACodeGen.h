@@ -97,6 +97,22 @@ private:
                                              RankedTensorType dstRtt,
                                              int srcN, int nElems);
 
+  // Per-register lane0 coordinates + lane/warp/block output-dim deltas for a
+  // distributed tensor. For pow2 tensors this is just toLinearLayout's apply +
+  // getBases. For native non-pow2 WGMMA N (omni-style n80) the tensor is the
+  // concatenation of pow2 split-fragments (n64 (+) n16); each fragment's regs
+  // carry the real per-fragment lane0 coords with the N-dim base offset applied,
+  // while the lane/warp/block deltas (fixed by the wgmma thread->(row,col) map,
+  // N-independent) come from the first fragment. This lets all the coordinate
+  // emitters work on n80 without ever materializing a non-representable LL.
+  struct RegCoordTable {
+    // [nElems][rank] lane0 coordinate of each register (offset baked in)
+    llvm::SmallVector<llvm::SmallVector<int>> regCoords;
+    // [bit][rank] output-dim delta contributed by each lane/warp/block bit
+    llvm::SmallVector<llvm::SmallVector<int>> laneBases, warpBases, blockBases;
+  };
+  RegCoordTable getRegCoordTable(RankedTensorType ty);
+
   // Swizzle helpers for NVMMAShared layout
   void emitSwizzledStoreToSmem(llvm::StringRef srcVar, llvm::StringRef dstVar,
                                gpu::BlockedEncodingAttr srcEnc,
@@ -187,6 +203,23 @@ private:
   // Does NOT emit a trailing __syncthreads (caller decides).
   void emitLayoutAwareSharedStore(mlir::Value val, gpu::MemDescType memDescType,
                                   llvm::StringRef dstVar);
+  // Register→shared store via stmatrix.x4 for an MMA-accumulator src tensor into
+  // a 128B-swizzled NVMMAShared dst. smemBaseExpr is a C++ expr for the buffer
+  // base as char* (e.g. "(char*)" + dstVar). Returns true iff it emitted the
+  // stmatrix store; false (no output) if the layouts are unsupported and the
+  // caller must fall back to emitLayoutAwareSharedStore.
+  bool emitStMatrixSharedStore(mlir::Value val, gpu::MemDescType memDescType,
+                               const std::string &smemBaseExpr);
+  // Register→shared store via stmatrix.trans for an MMA-accumulator src tensor
+  // into a TRANSPOSED 128B-swizzled NVMMAShared dst (the FA-backward dS^T /
+  // dq-handoff round-trip). Ports the PTX backend's LinearLayout-derived
+  // stmatrix.trans lowering (third_party/.../Utility.cpp lowerLdStMatrix) into
+  // CUDA emission. Handles native non-pow2 N (n80) by padding to pow2 and
+  // skipping phantom tiles. Returns true iff it emitted; false (no output) when
+  // the layout isn't stmatrix.trans-lowerable and the caller must fall back to
+  // the scalar emitLayoutAwareSharedStore.
+  bool emitStMatrixTransStore(mlir::Value val, gpu::MemDescType memDescType,
+                              const std::string &smemBaseExpr);
   void emitLocalLoad(gpu::LocalLoadOp op);
   void emitLocalDealloc(gpu::LocalDeallocOp op);
   void emitConvertLayout(gpu::ConvertLayoutOp op);

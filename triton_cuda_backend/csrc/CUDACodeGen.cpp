@@ -283,9 +283,67 @@ void CUDACodeGen::emitOrDeferElementwise(
   // Compute the body FIRST so any deferred operand materializes before this
   // value's own array/loop is opened (see materializeDeferred).
   std::string body = build("_i");
-  auto var = newVar("a");
+  // In-place reuse (opt-in via TRITON_EMIT_INPLACE_ELTWISE=1): if an operand is
+  // a materialized register array that is DEAD after this op (its only SSA use
+  // is here) and has EXACTLY the same tensor type (→ identical array length +
+  // element type), write the result INTO that operand's array instead of
+  // declaring a fresh one. This mirrors omni FA3-bwd's hand-written in-place
+  // updates (s_acc→P via exp2, dp_acc→dS via P*(dP-D)) that hold the consumer
+  // live-set at 168/0; the emitter's default one-array-per-SSA-value scheme
+  // spills because ptxas cannot coalesce fp32 transient arrays whose live
+  // ranges cross WGMMA async-wait boundaries. Element-wise safety: every output
+  // slot _i depends only on input slot _i of the SAME array, so the in-place
+  // overwrite is exact. hasOneUse() guarantees the array is referenced nowhere
+  // else (loop-carried/multi-use operands keep a use in the yield → skipped).
+  static const bool inplaceEltwise =
+      (getenv("TRITON_EMIT_INPLACE_ELTWISE") != nullptr) &&
+      (std::string(getenv("TRITON_EMIT_INPLACE_ELTWISE")) == "1");
+  std::string var;
+  if (inplaceEltwise) {
+    // The reusable dead array is often NOT a direct operand: elementwise fusion
+    // inlines single-use producers (e.g. P=exp2(S-lse) emits one loop reading
+    // the materialized S array inside a deferred subtract). So walk operands AND
+    // recurse THROUGH deferred (fused-away) operands to reach the materialized
+    // arrays actually referenced in this loop body. A materialized array that is
+    // single-use (its sole SSA use is consumed within this fused expression) is
+    // dead after the loop → safe to overwrite element-for-element.
+    llvm::SmallPtrSet<Value, 8> visited;
+    std::function<bool(Value)> findReuse = [&](Value v) -> bool {
+      if (!visited.insert(v).second)
+        return false;
+      // Deferred (fused) operand: descend into its producer's operands.
+      if (deferredElem.count(v)) {
+        if (Operation *d = v.getDefiningOp())
+          for (Value o : d->getOperands())
+            if (findReuse(o))
+              return true;
+        return false;
+      }
+      if (!isa<RankedTensorType>(v.getType()))
+        return false;
+      if (v.getType() != result.getType())
+        return false; // different array length or element type
+      if (v.getDefiningOp() == nullptr)
+        return false; // block arg / loop-carried — never reuse
+      if (!v.hasOneUse())
+        return false; // still live after this op
+      if (!valueToVar.count(v))
+        return false; // not a materialized register array
+      if (scalarValues.count(v) || deferredAddPtr.count(v) ||
+          ptrBasedDeferred.count(v) || scalarBaseDeferred.count(v))
+        return false; // not a plain dense register array
+      var = valueToVar[v]; // dead same-type array → destination-pass into it
+      return true;
+    };
+    for (Value o : op->getOperands())
+      if (findReuse(o))
+        break;
+  }
+  if (var.empty()) {
+    var = newVar("a");
+    emit(cudaType + " " + var + "[" + std::to_string(nElems) + "];");
+  }
   valueToVar[result] = var;
-  emit(cudaType + " " + var + "[" + std::to_string(nElems) + "];");
   emit("#pragma unroll");
   emit("for (int _i = 0; _i < " + std::to_string(nElems) + "; _i++)");
   emit("    " + var + "[_i] = " + body + ";");
@@ -402,6 +460,209 @@ llvm::ArrayRef<int64_t> CUDACodeGen::getTensorShape(Value val) {
   return {};
 }
 
+// ─── Backend-private split-layout for native non-pow2 WGMMA N (omni-style) ──
+// Triton's LinearLayout is GF(2)-based: a non-pow2 out-dim (e.g. N=80) cannot
+// be represented, so toLinearLayout aborts in strided1D. But wgmma.m64nNk16
+// accepts ANY N that is a multiple of 8. We model an n80 mma tensor as the
+// concatenation of two REAL pow2 sub-fragments (n64 (+) n16): the f32 D-fragment
+// registers are written n-block-contiguous, so a thread's regs[0..31] follow the
+// [M,64] mma layout and regs[32..39] follow the [M,16] mma layout (cols +64).
+// This helper returns the pow2 sub-RankedTensorTypes (with the encoding's
+// instrShape-N cloned to match each chunk) so all existing LinearLayout
+// machinery applies to each legal piece. Returns {} for pow2 / non-mma tensors.
+static llvm::SmallVector<mlir::RankedTensorType>
+splitNonPow2MmaTensor(mlir::RankedTensorType ty) {
+  using namespace mlir;
+  auto shape = ty.getShape();
+  int npDim = -1;
+  for (unsigned d = 0; d < shape.size(); d++)
+    if (!llvm::isPowerOf2_64(shape[d])) { npDim = (int)d; break; }
+
+  Attribute enc = ty.getEncoding();
+  ttg::NvidiaMmaEncodingAttr mma;
+  auto slice = dyn_cast<ttg::SliceEncodingAttr>(enc);
+  auto dop = dyn_cast<ttg::DotOperandEncodingAttr>(enc);
+  if (slice)
+    mma = dyn_cast<ttg::NvidiaMmaEncodingAttr>(slice.getParent());
+  else if (dop)
+    mma = dyn_cast<ttg::NvidiaMmaEncodingAttr>(dop.getParent());
+  else
+    mma = dyn_cast<ttg::NvidiaMmaEncodingAttr>(enc);
+  if (!mma)
+    return {};
+
+  auto instrShape = mma.getInstrShape();
+  bool mmaNNonPow2 =
+      instrShape.size() >= 2 && !llvm::isPowerOf2_64(instrShape[1]);
+  if (npDim < 0 && !mmaNNonPow2)
+    return {}; // fully representable — nothing to split
+
+  // For a DotOperand, the non-pow2 axis we split is the CONTRACTION (K) dim of
+  // the operand tensor itself (e.g. the [M=64, K=80] A operand of dV=P^T·dO),
+  // NOT the parent mma's N.  The parent mma (its instrShape[1]=N) must stay
+  // intact — only the operand's K shape splits into pow2 chunks (64⊕16).  So a
+  // dop is cloned with its parent UNCHANGED; the caller resizes subShape[npDim].
+  // For an accumulator (mma) / slice, the non-pow2 axis IS wgmma-N, so we clone
+  // the parent with instrShape[1] replaced by the chunk size `n`.
+  auto cloneEncWithN = [&](int64_t n) -> Attribute {
+    if (dop)
+      return (Attribute)dop; // keep parent mma + opIdx + kWidth; split shape only
+    SmallVector<unsigned> instr(instrShape.begin(), instrShape.end());
+    if (instr.size() >= 2)
+      instr[1] = (unsigned)n;
+    auto subMma = ttg::NvidiaMmaEncodingAttr::get(
+        mma.getContext(), mma.getVersionMajor(), mma.getVersionMinor(),
+        mma.getWarpsPerCTA(), mma.getCGALayout(), instr);
+    if (slice)
+      return ttg::SliceEncodingAttr::get(ty.getContext(), slice.getDim(),
+                                         subMma);
+    return (Attribute)subMma;
+  };
+
+  if (npDim < 0) {
+    // The non-pow2 N is squeezed out of this tensor's shape (e.g. a [64]
+    // row-slice of an N=80 mma): the per-thread distribution is N-independent,
+    // so a single representative piece with N rounded down to a pow2 suffices.
+    int64_t pn = 1;
+    while (pn * 2 <= instrShape[1])
+      pn *= 2;
+    return {RankedTensorType::get(shape, ty.getElementType(), cloneEncWithN(pn))};
+  }
+
+  // Descending pow2 decomposition of the non-pow2 size (80 -> 64, 16).
+  llvm::SmallVector<int64_t> chunks;
+  for (int64_t rem = shape[npDim]; rem > 0;) {
+    int64_t c = 1;
+    while (c * 2 <= rem)
+      c *= 2;
+    chunks.push_back(c);
+    rem -= c;
+  }
+
+  llvm::SmallVector<RankedTensorType> pieces;
+  for (int64_t c : chunks) {
+    Attribute subEnc = cloneEncWithN(c);
+    SmallVector<int64_t> subShape(shape.begin(), shape.end());
+    subShape[npDim] = c;
+    pieces.push_back(
+        RankedTensorType::get(subShape, ty.getElementType(), subEnc));
+  }
+  return pieces;
+}
+
+CUDACodeGen::RegCoordTable
+CUDACodeGen::getRegCoordTable(RankedTensorType ty) {
+  RegCoordTable t;
+  auto ctx = ty.getContext();
+  auto kReg = mlir::StringAttr::get(ctx, "register");
+  auto kLane = mlir::StringAttr::get(ctx, "lane");
+  auto kWarp = mlir::StringAttr::get(ctx, "warp");
+  auto kBlock = mlir::StringAttr::get(ctx, "block");
+
+  auto fillBases = [&](const triton::LinearLayout &ll) {
+    const auto &bases = ll.getBases();
+    auto grab = [&](mlir::StringAttr k,
+                    llvm::SmallVector<llvm::SmallVector<int>> &out) {
+      auto it = bases.find(k);
+      if (it == bases.end())
+        return;
+      for (auto &b : it->second) {
+        llvm::SmallVector<int> v;
+        for (auto x : b)
+          v.push_back((int)x);
+        out.push_back(v);
+      }
+    };
+    grab(kLane, t.laneBases);
+    grab(kWarp, t.warpBases);
+    grab(kBlock, t.blockBases);
+  };
+
+  auto pieces = splitNonPow2MmaTensor(ty);
+  if (pieces.empty()) {
+    auto ll = ttg::toLinearLayout(ty);
+    int n = getElemsPerThread(ty);
+    for (int i = 0; i < n; i++) {
+      auto coords = ll.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
+      llvm::SmallVector<int> v;
+      for (auto &c : coords)
+        v.push_back((int)c.second);
+      t.regCoords.push_back(v);
+    }
+    fillBases(ll);
+    return t;
+  }
+
+  // Native non-pow2 WGMMA N: concatenate the pow2 split-fragments. Each
+  // fragment's lane0 coords get the cumulative N-dim offset baked in; the
+  // lane/warp/block deltas (N-independent) come from the first fragment.
+  auto shape = ty.getShape();
+  int npDim = -1;
+  for (unsigned d = 0; d < shape.size(); d++)
+    if (!llvm::isPowerOf2_64(shape[d])) {
+      npDim = (int)d;
+      break;
+    }
+  // Collect each pow2 N-piece's lane0 register coords separately (in
+  // toLinearLayout order, with the cumulative N offset baked in).
+  std::vector<std::vector<llvm::SmallVector<int>>> pieceCoords;
+  int off = 0;
+  bool first = true;
+  for (auto p : pieces) {
+    auto llp = ttg::toLinearLayout(p);
+    int np = getElemsPerThread(p);
+    std::vector<llvm::SmallVector<int>> cur;
+    for (int i = 0; i < np; i++) {
+      auto coords = llp.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
+      llvm::SmallVector<int> v;
+      for (auto &c : coords)
+        v.push_back((int)c.second);
+      if (npDim >= 0 && npDim < (int)v.size())
+        v[npDim] += off;
+      cur.push_back(v);
+    }
+    pieceCoords.push_back(std::move(cur));
+    if (first) {
+      fillBases(llp);
+      first = false;
+    }
+    // When the non-pow2 N is squeezed out of this tensor's shape (npDim < 0),
+    // splitNonPow2MmaTensor returns a SINGLE representative piece, so there is
+    // no cumulative N offset to accumulate (and p.getShape()[npDim] would be an
+    // out-of-bounds read). Only advance the offset for a real split dim.
+    if (npDim >= 0)
+      off += (int)p.getShape()[npDim];
+  }
+
+  // emitWarpGroupDot writes the accumulator registers m64-TILE-MAJOR: for each
+  // m64 row-tile it emits one native wgmma whose n_out_regs outputs land
+  // contiguously, ordered [N-piece0 .. N-pieceK]. So for M>64 (multiple m64
+  // tiles) the producer layout is [m0: piece0,piece1][m1: piece0,piece1], NOT
+  // the piece-major [piece0: m0,m1][piece1: m0,m1] that a naive piece-by-piece
+  // concatenation would give. Regroup by m64 tile (the non-np / "M" dim of a 2D
+  // acc, split at wgmma_m=64) so the table matches what the wgmma actually
+  // produces. For M<=64 (single tile) this is a no-op. npDim<0 (N squeezed out)
+  // has a single piece and is unaffected.
+  if (npDim >= 0 && shape.size() == 2) {
+    int mDim = (npDim == 0) ? 1 : 0;
+    const int kWgmmaM = 64;
+    std::set<int> mtiles;
+    for (auto &pc : pieceCoords)
+      for (auto &v : pc)
+        mtiles.insert(v[mDim] / kWgmmaM);
+    for (int mt : mtiles)
+      for (auto &pc : pieceCoords)
+        for (auto &v : pc)
+          if (v[mDim] / kWgmmaM == mt)
+            t.regCoords.push_back(v);
+  } else {
+    for (auto &pc : pieceCoords)
+      for (auto &v : pc)
+        t.regCoords.push_back(v);
+  }
+  return t;
+}
+
 int CUDACodeGen::getElemsPerThread(Value val) {
   if (auto rtt = dyn_cast<RankedTensorType>(val.getType()))
     return getElemsPerThread(rtt);
@@ -411,6 +672,19 @@ int CUDACodeGen::getElemsPerThread(Value val) {
 int CUDACodeGen::getElemsPerThread(RankedTensorType ty) {
   auto encoding = ty.getEncoding();
   auto shape = ty.getShape();
+
+  // Native non-pow2 WGMMA N (omni-style n80): sum the per-thread counts of the
+  // pow2 split-layout sub-fragments instead of calling toLinearLayout on the
+  // GF(2)-non-representable shape.
+  {
+    auto pieces = splitNonPow2MmaTensor(ty);
+    if (!pieces.empty()) {
+      int total = 0;
+      for (auto p : pieces)
+        total += getElemsPerThread(p);
+      return std::max(total, 1);
+    }
+  }
 
   // For 3D+ tensors or double-slice encodings, use LinearLayout for correct element count
   bool needsLL = false;
@@ -3144,24 +3418,19 @@ void CUDACodeGen::emitMakeRange(tt::MakeRangeOp op) {
   auto var = newVar("rng");
   valueToVar[result] = var;
 
-  // Use LinearLayout to compute per-register values as f(register, lane, warp)
-  auto ll = ttg::toLinearLayout(rtt);
-  auto kReg = mlir::StringAttr::get(rtt.getContext(), "register");
-  auto kLane = mlir::StringAttr::get(rtt.getContext(), "lane");
-  auto kWarp = mlir::StringAttr::get(rtt.getContext(), "warp");
-  auto kBlock = mlir::StringAttr::get(rtt.getContext(), "block");
-  const auto &bases = ll.getBases();
-  const auto &laneBases = bases.find(kLane)->second;
-  const auto &warpBases = bases.find(kWarp)->second;
-  const auto &blockBases = bases.find(kBlock)->second;
+  // Per-register values as f(register, lane, warp). Uses the split-layout-aware
+  // coordinate table so native non-pow2 WGMMA N (omni-style n80) ranges work.
+  auto tbl = getRegCoordTable(rtt);
+  const auto &laneBases = tbl.laneBases;
+  const auto &warpBases = tbl.warpBases;
+  const auto &blockBases = tbl.blockBases;
 
   emit("int " + var + "[" + llvm::Twine(nElems).str() + "];");
   emit("{");
   indent();
 
   for (int i = 0; i < nElems; i++) {
-    auto coords = ll.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
-    int regBase = coords[0].second; // dim0 coordinate at lane=0, warp=0
+    int regBase = tbl.regCoords[i][0]; // dim0 coordinate at lane=0, warp=0
 
     // Build runtime expression: regBase + sum(lane_bit * lane_delta) + sum(warp_bit * warp_delta) + start
     std::string expr = std::to_string(regBase + start);
@@ -3225,6 +3494,32 @@ void CUDACodeGen::emitUnsplat(tt::UnsplatOp op) {
 llvm::SmallVector<int> CUDACodeGen::broadcastRegMapping(RankedTensorType srcRtt,
                                                         RankedTensorType dstRtt,
                                                         int srcN, int nElems) {
+  // Native non-pow2 WGMMA N (omni-style n80): LinearLayout is non-representable,
+  // so match coordinates via the split-layout-aware register-coordinate table.
+  // Array index == register index on both sides (no LL-compaction subtlety,
+  // since the mma D-fragment has no broadcast registers).
+  if (llvm::any_of(srcRtt.getShape(),
+                   [](int64_t d) { return !llvm::isPowerOf2_64(d); }) ||
+      llvm::any_of(dstRtt.getShape(),
+                   [](int64_t d) { return !llvm::isPowerOf2_64(d); })) {
+    auto srcTbl = getRegCoordTable(srcRtt);
+    auto dstTbl = getRegCoordTable(dstRtt);
+    auto srcShape = srcRtt.getShape();
+    std::map<llvm::SmallVector<int>, int> srcCoordToReg;
+    for (int i = 0; i < srcN && i < (int)srcTbl.regCoords.size(); i++)
+      srcCoordToReg.insert({srcTbl.regCoords[i], i}); // keep first occurrence
+    llvm::SmallVector<int> dstToSrc(nElems, 0);
+    for (int i = 0; i < nElems && i < (int)dstTbl.regCoords.size(); i++) {
+      llvm::SmallVector<int> srcKey;
+      for (size_t d = 0; d < dstTbl.regCoords[i].size(); d++)
+        srcKey.push_back(dstTbl.regCoords[i][d] %
+                         std::max((int64_t)1, srcShape[d]));
+      auto it = srcCoordToReg.find(srcKey);
+      dstToSrc[i] = (it != srcCoordToReg.end()) ? it->second : 0;
+    }
+    return dstToSrc;
+  }
+
   // For each dst register, find which src register has the same coordinates
   // on the non-broadcast dimensions. Broadcast dims have src.shape[d] == 1,
   // so the dst coord is taken modulo src.shape[d].
@@ -3502,31 +3797,29 @@ void CUDACodeGen::emitExpandDims(tt::ExpandDimsOp op) {
   } else {
     emit(cudaType + " " + var + "[" + std::to_string(nElems) + "];");
 
-    // Use LinearLayout to compute mapping from dst register to src register
+    // Use per-register coords to map dst register -> src register. Go through
+    // getRegCoordTable (not raw toLinearLayout) so native non-pow2 WGMMA-N
+    // tensors (omni-style n80) are handled via the pow2 split-layout instead of
+    // aborting in the GF(2) LinearLayout machinery.
     int axis = op.getAxis();
-    auto dstLL = ttg::toLinearLayout(rtt);
-    auto srcLL = ttg::toLinearLayout(srcRtt);
-    auto kReg = mlir::StringAttr::get(rtt.getContext(), "register");
-    auto kLane = mlir::StringAttr::get(rtt.getContext(), "lane");
-    auto kWarp = mlir::StringAttr::get(rtt.getContext(), "warp");
-    auto kBlock = mlir::StringAttr::get(rtt.getContext(), "block");
+    auto dstTbl = getRegCoordTable(rtt);
+    auto srcTbl = getRegCoordTable(srcRtt);
 
     // Build src register → coord mapping (without the expanded dim)
     std::map<SmallVector<int>, int> srcCoordToReg;
-    for (int i = 0; i < srcN; i++) {
-      auto coords = srcLL.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
-      SmallVector<int> key;
-      for (auto &c : coords) key.push_back(c.second);
+    for (int i = 0; i < srcN && i < (int)srcTbl.regCoords.size(); i++) {
+      SmallVector<int> key(srcTbl.regCoords[i].begin(),
+                           srcTbl.regCoords[i].end());
       srcCoordToReg[key] = i;
     }
 
     // For each dst register, strip the expanded dim and find src register
     SmallVector<int> dstToSrc(nElems, 0);
-    for (int i = 0; i < nElems; i++) {
-      auto dstCoords = dstLL.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
+    for (int i = 0; i < nElems && i < (int)dstTbl.regCoords.size(); i++) {
+      auto &dstCoords = dstTbl.regCoords[i];
       SmallVector<int> srcKey;
       for (int d = 0; d < (int)dstCoords.size(); d++) {
-        if (d != axis) srcKey.push_back(dstCoords[d].second);
+        if (d != axis) srcKey.push_back(dstCoords[d]);
       }
       auto it = srcCoordToReg.find(srcKey);
       dstToSrc[i] = (it != srcCoordToReg.end()) ? it->second : 0;
@@ -7087,6 +7380,15 @@ void CUDACodeGen::emitExternElementwise(tt::ExternElementwiseOp op) {
 // effect is multiplied by the replication factor. (Do NOT mask the `block`
 // dim: distinct CTAs legitimately each contribute a partial.)
 std::string CUDACodeGen::redundantThreadGuard(RankedTensorType ty) {
+  // Native non-pow2 (n80) tensors abort ttg::toLinearLayout (GF(2) pow2). A
+  // native non-pow2 WGMMA accumulator has NO thread replication — every
+  // (reg,lane,warp) owns a distinct element — so the redundancy guard is empty.
+  // (Only reachable for non-pow2 mma acc, e.g. the dQ=K^T·dS^T atomic-add drain;
+  // pow2 layouts keep the exact prior behavior.)
+  if (llvm::any_of(ty.getShape(),
+                   [](int64_t d) { return !llvm::isPowerOf2_64(d); }) &&
+      isa<ttg::NvidiaMmaEncodingAttr>(ty.getEncoding()))
+    return "";
   auto ll = ttg::toLinearLayout(ty);
   auto *ctx = ty.getContext();
   auto freeMasks = ll.getFreeVariableMasks();
@@ -8176,9 +8478,73 @@ void CUDACodeGen::emitScfWhile(scf::WhileOp op) {
     }
   }
 
+  // ── In-place loop-carry aliasing (opt-in via TRITON_EMIT_INPLACE_ELTWISE) ──
+  // The default lowering gives each loop-carried tensor TWO register arrays:
+  // `witer` (the iter-arg / yield target) and `wcond` (the before→after
+  // forwarded copy the body accumulates into), with a per-iteration copy
+  // `wcond[_t]=witer[_t]`. Both stay live across the whole body → the
+  // persistent accumulators (dv/dk in FA3-bwd) are DOUBLED, which is the real
+  // 316B-spill / C7512 driver (ptxas can't coalesce two [64] arrays live across
+  // WGMMA async-waits). When the before-region simply FORWARDS the iter-arg
+  // (condArgs[i] == beforeArgs[i], the ordinary for-loop case), `wcond` can
+  // ALIAS `witer`: one array, no copy. Swap-safety guard below: never alias an
+  // arg that a DIFFERENT yield reads (would clobber it mid yield-copy phase).
+  static const bool inplaceCarry =
+      (getenv("TRITON_EMIT_INPLACE_ELTWISE") != nullptr) &&
+      (std::string(getenv("TRITON_EMIT_INPLACE_ELTWISE")) == "1");
+  auto beforeArgsAll = op.getBeforeArguments();
+  auto afterArgsAll = op.getAfterArguments();
+  auto condTerm = dyn_cast<scf::ConditionOp>(op.getBefore().front().getTerminator());
+  auto yieldTerm = dyn_cast<scf::YieldOp>(op.getAfter().front().getTerminator());
+  llvm::SmallVector<bool> aliasCarry(inits.size(), false);
+  if (inplaceCarry && condTerm && yieldTerm) {
+    auto condArgs = condTerm.getArgs();
+    // Candidate: pure forward of the iter-arg, and a register tensor.
+    for (unsigned i = 0; i < inits.size(); i++)
+      aliasCarry[i] = isa<RankedTensorType>(inits[i].getType()) &&
+                      i < condArgs.size() && i < beforeArgsAll.size() &&
+                      condArgs[i] == beforeArgsAll[i];
+    // Swap-safety: disable aliasing for any after-arg k that some yield operand
+    // j != k reads (transitively). Aliasing k would overwrite witer[k] during
+    // yield[j<k? — any order]; only self-referential accumulation is safe.
+    for (unsigned k = 0; k < inits.size(); k++) {
+      if (!aliasCarry[k] || k >= afterArgsAll.size())
+        continue;
+      Value selfAfter = afterArgsAll[k];
+      for (unsigned j = 0; j < yieldTerm.getNumOperands(); j++) {
+        if (j == k)
+          continue;
+        llvm::SmallPtrSet<Value, 16> seen;
+        std::function<bool(Value)> reads = [&](Value v) -> bool {
+          if (v == selfAfter)
+            return true;
+          if (!seen.insert(v).second)
+            return false;
+          if (Operation *d = v.getDefiningOp())
+            for (Value o : d->getOperands())
+              if (reads(o))
+                return true;
+          return false;
+        };
+        if (reads(yieldTerm.getOperand(j))) {
+          aliasCarry[k] = false;
+          break;
+        }
+      }
+    }
+  }
+
   // Create condition output variables + map results
   llvm::SmallVector<std::string> condOutVars;
   for (unsigned i = 0; i < inits.size(); i++) {
+    // Aliased carry: reuse the witer array as the condition/after-arg storage —
+    // no separate wcond array, no per-iteration copy.
+    if (aliasCarry[i]) {
+      condOutVars.push_back(iterVars[i]);
+      if (i < op.getNumResults())
+        valueToVar[op.getResult(i)] = iterVars[i];
+      continue;
+    }
     auto condVar = newVar("wcond");
     condOutVars.push_back(condVar);
     bool isTensor = isa<RankedTensorType>(inits[i].getType());
@@ -8212,6 +8578,9 @@ void CUDACodeGen::emitScfWhile(scf::WhileOp op) {
       auto condArgs = conditionOp.getArgs();
       for (unsigned i = 0; i < condArgs.size() && i < condOutVars.size(); i++) {
         auto srcVar = getVar(condArgs[i]);
+        // Aliased loop-carry: condOutVar IS the witer array → copy is a no-op.
+        if (srcVar == condOutVars[i])
+          continue;
         bool isTensor = isa<RankedTensorType>(condArgs[i].getType());
         if (isTensor) {
           int nElems = getElemsPerThread(condArgs[i]);
@@ -8242,11 +8611,15 @@ void CUDACodeGen::emitScfWhile(scf::WhileOp op) {
         auto srcVar = getVar(yieldOp.getOperand(i));
         bool isTensor = isa<RankedTensorType>(yieldOp.getOperand(i).getType());
         if (isTensor) {
-          int nElems = getElemsPerThread(yieldOp.getOperand(i));
-          emit("#pragma unroll");
-          emit("for (int _t = 0; _t < " + std::to_string(nElems) +
-               "; _t++) " + iterVars[i] + "[_t] = " +
-               getElemExpr(yieldOp.getOperand(i), "_t") + ";");
+          // Aliased in-place accumulation: yield value already lives in the
+          // witer array (body accumulated into it) → skip the self-copy.
+          if (iterVars[i] != srcVar) {
+            int nElems = getElemsPerThread(yieldOp.getOperand(i));
+            emit("#pragma unroll");
+            emit("for (int _t = 0; _t < " + std::to_string(nElems) +
+                 "; _t++) " + iterVars[i] + "[_t] = " +
+                 getElemExpr(yieldOp.getOperand(i), "_t") + ";");
+          }
         } else if (isa<tt::TensorDescType>(yieldOp.getOperand(i).getType())) {
           std::string srcExpr = descAddrExpr(yieldOp.getOperand(i));
           if (iterVars[i] != srcExpr)
@@ -8941,11 +9314,21 @@ void CUDACodeGen::emitLocalAlloc(ttg::LocalAllocOp op) {
         emitLayoutAwareSharedStore(src, memDescType, var);
         blockSync();
       } else {
-        // Fallback
-        emit("// Store to shared memory (linear fallback)");
-        emit("#pragma unroll");
-        emit("for (int _i = 0; _i < " + std::to_string(nElems) + "; _i++)");
-        emit("    " + var + "[tid * " + std::to_string(nElems) + " + _i] = " + srcVar + "[_i];");
+        // Distributed tensor src whose layout is neither Blocked nor NvidiaMma
+        // (e.g. a #linear layout produced by tt.trans of an MMA result, or a
+        // sliced layout) → plain / swizzled non-nvmma shared. The old naive
+        // tid*nElems+i store is only correct when the per-thread register order
+        // happens to equal smem row-major; for a #linear/MMA source it does NOT
+        // (the registers carry (row,col) per the source LinearLayout, not
+        // contiguously), so it scrambled the operand. This bit dq in the fused
+        // FA3 backward: dq = dot(trans(dsT), k) lowers to local_alloc(#linear)
+        // → local_load as the WGMMA A operand; the linear-fallback store placed
+        // a thread's regs at tid*64+i while the reader expected the logical
+        // (row,col) mapping, so the A operand was garbage and dq was wrong.
+        // emitLayoutAwareSharedStore maps each register to its logical (row,col)
+        // via the source LinearLayout and the dst order, exactly matching the
+        // plain reader (emitLocalLoad generic path).
+        emitLayoutAwareSharedStore(src, memDescType, var);
         blockSync();
       }
     }
@@ -8967,8 +9350,404 @@ void CUDACodeGen::emitLocalStore(ttg::LocalStoreOp op) {
   // source distributed layout (e.g. MMA accumulator) and the destination
   // shared swizzle. emitLayoutAwareSharedStore mirrors MemoryOpToLLVM.cpp.
   auto memDescType = cast<ttg::MemDescType>(dst.getType());
-  emitLayoutAwareSharedStore(val, memDescType, dstVar);
+  // Fast path: an MMA-accumulator register tensor stored into a 128B-swizzled
+  // NVMMAShared buffer goes via stmatrix.x4 (same as the local_alloc-with-init
+  // epilogue path), replacing the scalar per-element swizzled store (e.g. 32
+  // st.shared.b16/thread for a [64,64] bf16 tile → 4 stmatrix). The PTX backend
+  // lowers ttg.local_store this way too; emit_cuda previously only did it for
+  // local_alloc, leaving FA-backward's dsT round-trip scalar.
+  if (!emitStMatrixSharedStore(val, memDescType, "(char*)" + dstVar) &&
+      !emitStMatrixTransStore(val, memDescType, "(char*)" + dstVar))
+    emitLayoutAwareSharedStore(val, memDescType, dstVar);
   blockSync();
+}
+
+// stmatrix.x4 store of an MMA-accumulator src into a 128B-swizzled NVMMAShared
+// dst. Mirrors the epilogue path in emitLocalAlloc (kept duplicated rather than
+// refactored to avoid disturbing that proven GEMM path). Returns false (emitting
+// nothing) when the layouts are not the supported MMA→128B-swizzle 16-bit case.
+bool CUDACodeGen::emitStMatrixSharedStore(Value val,
+                                          ttg::MemDescType memDescType,
+                                          const std::string &smemBaseExpr) {
+  auto srcRtt = cast<RankedTensorType>(val.getType());
+  auto srcEnc = srcRtt.getEncoding();
+  auto mmaEnc = dyn_cast_or_null<ttg::NvidiaMmaEncodingAttr>(srcEnc);
+  if (!mmaEnc)
+    return false;
+  auto nvmmaShared =
+      dyn_cast_or_null<ttg::NVMMASharedEncodingAttr>(memDescType.getEncoding());
+  if (!nvmmaShared)
+    return false;
+  int elemBytes = getTypeSizeInBytes(srcRtt.getElementType());
+  if (elemBytes != 2)
+    return false; // stmatrix.b16 only; fp8/fp32 use scalar path
+  if (nvmmaShared.getSwizzlingByteWidth() != 128)
+    return false; // _base swizzle formula below assumes 128B
+  if (nvmmaShared.getTransposed())
+    return false; // transposed shared needs stmatrix.trans, not handled here
+
+  auto shape = srcRtt.getShape();
+  if (shape.size() != 2)
+    return false;
+  auto shapePerCTAStm = ttg::getShapePerCTA(mmaEnc, shape);
+  auto wpcChk = mmaEnc.getWarpsPerCTA();
+  bool nSplitWg = wpcChk.size() > 1 && wpcChk[1] > 1;
+  int numWgN = nSplitWg ? (int)wpcChk[1] : 1;
+  bool nSplitOk =
+      !nSplitWg ||
+      (shapePerCTAStm.size() > 1 &&
+       ((int)shapePerCTAStm[1] / numWgN) % 64 == 0 && wpcChk[0] <= 4);
+  if (!nSplitOk)
+    return false;
+
+  auto srcVar = getVar(val);
+  int BM = shapePerCTAStm[0];
+  int BN = shapePerCTAStm[1];
+  if (BN % 64 != 0 || BM % 64 != 0)
+    return false;
+  auto wpc = mmaEnc.getWarpsPerCTA();
+  int numWgM = std::max<int>(1, (int)wpc[0] / 4);
+  int BNwg = BN / numWgN;
+  int m64PerWg = std::max(1, (BM / numWgM) / 64);
+  int nBlocks = std::max(1, BNwg / 64);
+  int nblockBytes = BM * 64 * elemBytes;
+  int stripeBytes = 64 * 64 * elemBytes;
+  int packedPerMb = BNwg / 4;
+  int nPacked = m64PerWg * packedPerMb;
+  std::string wgM = numWgM > 1 ? "_wg_m" : "0";
+  std::string wgN = numWgN > 1 ? "_wg_m" : "0";
+
+  emit("// register→shared store via stmatrix (MMA acc → 128B-swizzle NVMMA)");
+  emit("{");
+  indent();
+  emit("uint32_t _base = ((tid << 7) & 0x780) | ((tid << 4) & 0x70);");
+  emit("_base = (_base ^ (tid & 0x10)) | ((tid << 6) & 0x1800);");
+  emit("char* _smem_base = " + smemBaseExpr + ";");
+  emit("uint32_t _packed[" + std::to_string(nPacked) + "];");
+  emit("#pragma unroll");
+  emit("for (int _i = 0; _i < " + std::to_string(nPacked) + "; _i++) {");
+  indent();
+  emit("uint32_t _lo = *(uint16_t*)&" + srcVar + "[2*_i];");
+  emit("uint32_t _hi = *(uint16_t*)&" + srcVar + "[2*_i+1];");
+  emit("_packed[_i] = _lo | (_hi << 16);");
+  dedent();
+  emit("}");
+  for (int mb = 0; mb < m64PerWg; mb++) {
+    for (int nGrp = 0; nGrp < 4; nGrp++) {
+      for (int blk = 0; blk < nBlocks; blk++) {
+        int localP = blk * 16 + nGrp * 4;
+        int packedStart = mb * packedPerMb + localP;
+        int xorVal = nGrp * 32;
+        std::string stripeExpr = "(" + std::to_string(mb) + " * " +
+                                 std::to_string(numWgM) + " + " + wgM + ")";
+        std::string smemOff = "(" + wgN + " * " + std::to_string(nBlocks) +
+                              " + " + std::to_string(blk) + ") * " +
+                              std::to_string(nblockBytes) + " + " + stripeExpr +
+                              " * " + std::to_string(stripeBytes);
+        std::string addrExpr =
+            xorVal ? ("_base ^ " + std::to_string(xorVal)) : "_base";
+        emit("asm volatile(\"stmatrix.sync.aligned.m8n8.x4.shared.b16 "
+             "[%0], {%1,%2,%3,%4};\"");
+        emit("    :: \"r\"((unsigned)__cvta_generic_to_shared(_smem_base + (" +
+             addrExpr + ") + (" + smemOff + "))),");
+        emit("       \"r\"(_packed[" + std::to_string(packedStart) +
+             "]), \"r\"(_packed[" + std::to_string(packedStart + 1) + "]),");
+        emit("       \"r\"(_packed[" + std::to_string(packedStart + 2) +
+             "]), \"r\"(_packed[" + std::to_string(packedStart + 3) + "]));");
+      }
+    }
+  }
+  dedent();
+  emit("}");
+  return true;
+}
+
+// Register→shared store via stmatrix.trans into a TRANSPOSED 128B-swizzled
+// NVMMAShared dst (FA-backward dS^T / dq-handoff round-trip). CUDA-emission port
+// of the PTX backend's LinearLayout-derived lowering (LLVM::NVIDIA::
+// lowerLdStMatrix in third_party/nvidia/.../Utility.cpp, transpose=true/store).
+// All addressing comes from cvt = regLayout.invertAndCompose(memLayout), so the
+// bytes written match exactly what the dQ wgmma B-operand reads. Native non-pow2
+// N (omni n80) is handled by padding both layouts to pow2 and emitting stmatrix
+// instructions ONLY for tiles whose source registers all lie inside the real
+// (unpadded) shape; phantom-padding tiles are skipped. Returns false (no output)
+// for any layout it cannot prove stmatrix.trans-lowerable → scalar fallback.
+bool CUDACodeGen::emitStMatrixTransStore(Value val,
+                                         ttg::MemDescType memDescType,
+                                         const std::string &smemBaseExpr) {
+  auto srcRtt = cast<RankedTensorType>(val.getType());
+  auto mmaEnc =
+      dyn_cast_or_null<ttg::NvidiaMmaEncodingAttr>(srcRtt.getEncoding());
+  if (!mmaEnc)
+    return false;
+  auto nvmmaShared =
+      dyn_cast_or_null<ttg::NVMMASharedEncodingAttr>(memDescType.getEncoding());
+  if (!nvmmaShared || !nvmmaShared.getTransposed())
+    return false; // only the transposed case; non-trans → emitStMatrixSharedStore
+  if (getTypeSizeInBytes(srcRtt.getElementType()) != 2)
+    return false; // stmatrix.b16 only
+  if (nvmmaShared.getSwizzlingByteWidth() != 128)
+    return false;
+  auto srcShape = srcRtt.getShape();
+  auto memShape = memDescType.getShape();
+  if (srcShape.size() != 2 || memShape.size() != 2)
+    return false;
+  // Under transposed=true the CONTIGUOUS/swizzle axis is dim0 (= swizzle width
+  // / elemBytes); the strided axis is dim1 (its stride = dim0 size). Only dim1
+  // may be non-pow2: padding it leaves every real offset unchanged because the
+  // colgroup stride = dim0 size stays pow2. A non-pow2 dim0 (contiguous) would
+  // need the scalar path's colstride rescale, so bail.
+  if (!llvm::isPowerOf2_64(memShape[0]))
+    return false;
+
+  auto ctx = srcRtt.getContext();
+  auto kReg = mlir::StringAttr::get(ctx, "register");
+  auto kLane = mlir::StringAttr::get(ctx, "lane");
+  auto kWarp = mlir::StringAttr::get(ctx, "warp");
+  auto kBlock = mlir::StringAttr::get(ctx, "block");
+  auto kOffset = mlir::StringAttr::get(ctx, "offset");
+  auto kAddr = mlir::StringAttr::get(ctx, "addr");
+  auto kIdx = mlir::StringAttr::get(ctx, "idx");
+  const int bitwidth = 16;
+  const int byteScale = bitwidth / 8; // 2
+
+  // ---- pad reg + mem layouts to pow2 (no-op when already pow2) -------------
+  SmallVector<int64_t> padRegShape(srcShape.begin(), srcShape.end());
+  int npReg = -1;
+  for (int d = 0; d < (int)padRegShape.size(); d++)
+    if (!llvm::isPowerOf2_64(padRegShape[d])) {
+      int64_t p = 1;
+      while (p < padRegShape[d])
+        p *= 2;
+      padRegShape[d] = p;
+      npReg = d;
+    }
+  SmallVector<unsigned> instr(mmaEnc.getInstrShape().begin(),
+                              mmaEnc.getInstrShape().end());
+  if (npReg >= 0 && instr.size() >= 2)
+    instr[1] = (unsigned)padRegShape[npReg];
+  auto padMma = ttg::NvidiaMmaEncodingAttr::get(
+      ctx, mmaEnc.getVersionMajor(), mmaEnc.getVersionMinor(),
+      mmaEnc.getWarpsPerCTA(), mmaEnc.getCGALayout(), instr);
+  auto padRegTy =
+      RankedTensorType::get(padRegShape, srcRtt.getElementType(), padMma);
+
+  SmallVector<int64_t> padMemShape(memShape.begin(), memShape.end());
+  for (int d = 0; d < (int)padMemShape.size(); d++)
+    if (!llvm::isPowerOf2_64(padMemShape[d])) {
+      int64_t p = 1;
+      while (p < padMemShape[d])
+        p *= 2;
+      padMemShape[d] = p;
+    }
+  auto realAlloc = memDescType.getAllocShape();
+  SmallVector<int64_t> padAlloc(realAlloc.begin(), realAlloc.end());
+  for (int d = 0; d < (int)padAlloc.size(); d++)
+    if (!llvm::isPowerOf2_64(padAlloc[d])) {
+      int64_t p = 1;
+      while (p < padAlloc[d])
+        p *= 2;
+      padAlloc[d] = p;
+    }
+  auto padMemTy = ttg::MemDescType::get(
+      ctx, padMemShape, memDescType.getElementType(),
+      memDescType.getEncoding(), memDescType.getMemorySpace(),
+      memDescType.getMutableMemory(), padAlloc);
+
+  auto regLayoutPad = ttg::toLinearLayout(padRegTy);
+  auto memLayoutPad = ttg::toLinearLayout(padMemTy);
+  auto cvt = regLayoutPad.invertAndCompose(memLayoutPad);
+  // Drop the (trivial, single-CTA) block dim → (reg,lane,warp)->offset.
+  if (!cvt.sublayoutIsZero({kBlock}, {kOffset}))
+    return false;
+  cvt = cvt.sublayout({kReg, kLane, kWarp}, {kOffset});
+
+  // ---- transpose-store tile algebra (mirrors lowerLdStMatrix) -------------
+  int contigRegs = 32 / bitwidth; // 2
+  auto fullTile = LinearLayout::identity1D(contigRegs, kReg, kAddr) *
+                  LinearLayout::identity1D(4, kLane, kAddr) *
+                  LinearLayout::identity1D(8, kLane, kOffset) *
+                  LinearLayout::identity1D(16 / bitwidth, kReg, kOffset);
+  if (cvt.getInDimSize(kReg) < fullTile.getInDimSize(kReg))
+    return false;
+  std::vector<size_t> regBases, laneBases;
+  for (const auto &basis : fullTile.invert().getBases().lookup(kOffset)) {
+    if (basis.size() != 2)
+      return false;
+    if (basis[0] != 0)
+      regBases.push_back(llvm::Log2_32(basis[0]));
+    else
+      laneBases.push_back(llvm::Log2_32(basis[1]));
+  }
+  for (int i = 0; i < cvt.getInDimSizeLog2(kReg); i++)
+    if (!llvm::is_contained(regBases, (size_t)i))
+      regBases.push_back(i);
+  for (int i = 0; i < cvt.getInDimSizeLog2(kLane); i++)
+    if (!llvm::is_contained(laneBases, (size_t)i))
+      laneBases.push_back(i);
+  if (laneBases != std::vector<size_t>({2, 3, 4, 0, 1}))
+    return false;
+  ColumnAction permReg(regBases, kReg, cvt.getInDimSizeLog2(kReg));
+  ColumnAction permLanes(laneBases, kLane, cvt.getInDimSizeLog2(kLane));
+  cvt = permReg.apply(cvt);
+  cvt = permLanes.apply(cvt);
+  // idLL tracks the register-index permutation applied to the value vector so
+  // that final emission slot s → original padded-reg index = idLL.apply({s}).
+  auto idLL = LinearLayout::identity1D(cvt.getInDimSize(kReg), kReg, kIdx);
+  idLL = permReg.apply(idLL);
+
+  auto tile = (LinearLayout::identity1D(8, kLane, kOffset) *
+               LinearLayout::identity1D(16 / bitwidth, kReg, kOffset))
+                  .transposeIns({kReg, kLane});
+  auto maybePermDivide = regPermForDivide(cvt, tile, /*left=*/true);
+  if (!maybePermDivide)
+    return false;
+  ColumnAction permDivide = maybePermDivide.value();
+  cvt = permDivide.apply(cvt);
+  idLL = permDivide.apply(idLL);
+  auto maybeQuot = divideLeft(cvt, tile);
+  if (!maybeQuot)
+    return false;
+  auto reps = zerosLike(tile) * maybeQuot.value();
+  // revert lane/reg permutations
+  reps = permLanes.inverse().apply(reps);
+  reps = permReg.inverse().apply(reps);
+  idLL = permReg.inverse().apply(idLL);
+
+  // ---- vectorisation + per-lane address layout ----------------------------
+  int regsPerCoreTile = fullTile.getInDimSize(kReg); // 2
+  if (regsPerCoreTile * bitwidth != 32)
+    return false;
+  int vec = std::min<int>(128 / bitwidth, reps.getInDimSize(kReg)) /
+            regsPerCoreTile;
+  if (vec != 1 && vec != 2 && vec != 4)
+    return false;
+  auto fullTileVec = fullTile * LinearLayout::identity1D(vec, kReg, kAddr);
+  fullTileVec = fullTileVec * LinearLayout::identity1D(1, kWarp, kAddr);
+  auto addrToOffset = fullTileVec.invert().compose(reps);
+  LinearLayout addrLayout(
+      {{kLane, addrToOffset.getBases().lookup(kAddr)},
+       {kWarp, reps.getBases().lookup(kWarp)}},
+      {{kOffset, reps.getOutDimSize(kOffset)}}, false);
+  auto addStrides = actionAdditiveStrides(reps, addrLayout, /*maskSpan=*/0);
+  int64_t nAdditive = addStrides.first;
+  ColumnAction permStrides = addStrides.second;
+  reps = permStrides.apply(reps);
+  idLL = permStrides.apply(idLL);
+  if (nAdditive <= 0)
+    return false;
+
+  int elemsPerVec = 32 / bitwidth;                 // 2 (b16 per i32)
+  int elemsPerInstr = fullTileVec.getInDimSize(kReg); // = contigRegs*vec
+  int nInputs = elemsPerInstr / elemsPerVec;          // matrices per instr (.xN)
+  if (nInputs != 1 && nInputs != 2 && nInputs != 4)
+    return false;
+
+  // real split-layout register coords → real emitted-register index
+  auto realTbl = getRegCoordTable(srcRtt);
+  int nRealElems = getElemsPerThread(srcRtt);
+  std::map<SmallVector<int>, int> realCoordToReg;
+  for (int i = 0; i < nRealElems && i < (int)realTbl.regCoords.size(); i++)
+    realCoordToReg[realTbl.regCoords[i]] = i;
+  // padded slot s → real register index (-1 if phantom/out-of-real-shape)
+  auto mapReal = [&](int slot) -> int {
+    int idx = (int)idLL.apply({{kReg, slot}}).front().second;
+    auto c = regLayoutPad.apply(
+        {{kReg, idx}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
+    SmallVector<int> key;
+    for (int d = 0; d < (int)c.size(); d++) {
+      int v = (int)c[d].second;
+      if (d < (int)srcShape.size() && v >= (int)srcShape[d])
+        return -1; // phantom padding element
+      key.push_back(v);
+    }
+    auto it = realCoordToReg.find(key);
+    return it == realCoordToReg.end() ? -1 : it->second;
+  };
+
+  auto cty = getCUDAType(srcRtt.getElementType());
+
+  // ---- per-lane base address CUDA expression ------------------------------
+  std::string raExpr = "0";
+  for (int b = 0; b < addrLayout.getInDimSizeLog2(kLane); b++) {
+    int64_t off =
+        addrLayout.apply({{kLane, 1 << b}, {kWarp, 0}}).front().second *
+        byteScale;
+    if (off)
+      raExpr += " ^ (((lane_id >> " + std::to_string(b) + ") & 1) * " +
+                std::to_string(off) + ")";
+  }
+  for (int b = 0; b < addrLayout.getInDimSizeLog2(kWarp); b++) {
+    int64_t off =
+        addrLayout.apply({{kLane, 0}, {kWarp, 1 << b}}).front().second *
+        byteScale;
+    if (off)
+      raExpr += " ^ (((warp_id >> " + std::to_string(b) + ") & 1) * " +
+                std::to_string(off) + ")";
+  }
+
+  // qualifier order matches the existing non-trans path: shape.num.trans
+  std::string xN = "x" + std::to_string(nInputs) + ".trans";
+  std::string regList, regSpec;
+  for (int k = 0; k < nInputs; k++) {
+    regList += (k ? ",%" : "%") + std::to_string(k + 1);
+    regSpec += std::string(k ? ", " : "") + "\"r\"(_pk" + std::to_string(k) + ")";
+  }
+
+  emit("// register→shared store via stmatrix.trans (MMA acc → transposed "
+       "128B-swizzle NVMMA)");
+  emit("{");
+  indent();
+  emit("char* _smem_base = " + smemBaseExpr + ";");
+  emit("uint32_t _ra = (uint32_t)(" + raExpr + ");");
+  for (int i = 0; i < cvt.getInDimSize(kReg); i += nAdditive) {
+    int64_t regIdxOff =
+        reps.apply({{kReg, i}, {kLane, 0}, {kWarp, 0}}).front().second *
+        byteScale;
+    for (int i2 = 0; i2 < (int)nAdditive; i2 += elemsPerInstr) {
+      int64_t regIdxAdd =
+          reps.apply({{kReg, i2}, {kLane, 0}, {kWarp, 0}}).front().second *
+          byteScale;
+      // gather the nInputs packed register pairs for this instruction
+      std::vector<std::pair<int, int>> packs;
+      bool anyReal = false, allReal = true;
+      for (int j = 0; j < elemsPerInstr; j += elemsPerVec) {
+        int r0 = mapReal(i + i2 + j + 0);
+        int r1 = mapReal(i + i2 + j + 1);
+        if (r0 < 0 || r1 < 0)
+          allReal = false;
+        else
+          anyReal = true;
+        packs.push_back({r0, r1});
+      }
+      if (!anyReal)
+        continue; // entirely phantom tile (padding) → skip
+      if (!allReal)
+        return false; // mixed real/phantom — unexpected → scalar fallback
+      emit("{");
+      indent();
+      for (int k = 0; k < nInputs; k++) {
+        std::string e0 = getElemExpr(val, std::to_string(packs[k].first));
+        std::string e1 = getElemExpr(val, std::to_string(packs[k].second));
+        emit(cty + " _t0_" + std::to_string(k) + " = (" + e0 + "); " + cty +
+             " _t1_" + std::to_string(k) + " = (" + e1 + ");");
+        emit("uint32_t _pk" + std::to_string(k) + " = (uint32_t)*(uint16_t*)&_t0_" +
+             std::to_string(k) + " | ((uint32_t)*(uint16_t*)&_t1_" +
+             std::to_string(k) + " << 16);");
+      }
+      std::string addrExpr = "(_ra ^ " + std::to_string(regIdxOff) + ") + " +
+                             std::to_string(regIdxAdd);
+      emit("asm volatile(\"stmatrix.sync.aligned.m8n8." + xN +
+           ".shared.b16 [%0], {" + regList + "};\"");
+      emit("    :: \"r\"((unsigned)__cvta_generic_to_shared(_smem_base) + (" +
+           addrExpr + ")), " + regSpec + ");");
+      dedent();
+      emit("}");
+    }
+  }
+  dedent();
+  emit("}");
+  return true;
 }
 
 // Register→shared store that respects an arbitrary src distributed layout and
@@ -8987,6 +9766,177 @@ void CUDACodeGen::emitLayoutAwareSharedStore(Value val,
   auto kLane = mlir::StringAttr::get(ctx, "lane");
   auto kWarp = mlir::StringAttr::get(ctx, "warp");
   auto kOffset = mlir::StringAttr::get(ctx, "offset");
+  auto kBlock0 = mlir::StringAttr::get(ctx, "block");
+
+  // Native non-pow2 (omni-style n80) register→shared store. The GF(2)
+  // LinearLayout machinery aborts on any non-pow2 shape dim, so PAD every
+  // non-pow2 dim up to the next pow2 on BOTH the register tensor and the shared
+  // destination, run the normal invertAndCompose addressing on the padded
+  // (pow2) layouts, and emit stores ONLY for the registers whose padded coord
+  // lies inside the REAL shape (mapped back to the real split-layout register
+  // array via getRegCoordTable). Padding only an OUTER smem dim leaves the
+  // inner-contiguous swizzle atom (and therefore every real element offset)
+  // unchanged, so the wgmma B-operand reads back exactly what we wrote.
+  {
+    auto srcShape = srcRtt.getShape();
+    auto memShape = memDescType.getShape();
+    bool regNonPow2 = llvm::any_of(
+        srcShape, [](int64_t d) { return !llvm::isPowerOf2_64(d); });
+    bool memNonPow2 = llvm::any_of(
+        memShape, [](int64_t d) { return !llvm::isPowerOf2_64(d); });
+    auto srcMma =
+        dyn_cast<ttg::NvidiaMmaEncodingAttr>(srcRtt.getEncoding());
+    if ((regNonPow2 || memNonPow2) && srcMma) {
+      // --- padded register type (bump instrShape-N to the padded N dim) ---
+      SmallVector<int64_t> padRegShape(srcShape.begin(), srcShape.end());
+      int npReg = -1;
+      for (int d = 0; d < (int)padRegShape.size(); d++) {
+        if (!llvm::isPowerOf2_64(padRegShape[d])) {
+          int64_t p = 1;
+          while (p < padRegShape[d])
+            p *= 2;
+          padRegShape[d] = p;
+          npReg = d;
+        }
+      }
+      SmallVector<unsigned> instr(srcMma.getInstrShape().begin(),
+                                  srcMma.getInstrShape().end());
+      if (npReg >= 0 && instr.size() >= 2)
+        instr[1] = (unsigned)padRegShape[npReg];
+      auto padMma = ttg::NvidiaMmaEncodingAttr::get(
+          ctx, srcMma.getVersionMajor(), srcMma.getVersionMinor(),
+          srcMma.getWarpsPerCTA(), srcMma.getCGALayout(), instr);
+      auto padRegTy = RankedTensorType::get(padRegShape,
+                                            srcRtt.getElementType(), padMma);
+
+      // --- padded shared destination (same encoding, padded shape+alloc) ---
+      SmallVector<int64_t> padMemShape(memShape.begin(), memShape.end());
+      for (int d = 0; d < (int)padMemShape.size(); d++)
+        if (!llvm::isPowerOf2_64(padMemShape[d])) {
+          int64_t p = 1;
+          while (p < padMemShape[d])
+            p *= 2;
+          padMemShape[d] = p;
+        }
+      auto realAlloc = memDescType.getAllocShape();
+      SmallVector<int64_t> padAlloc(realAlloc.begin(), realAlloc.end());
+      for (int d = 0; d < (int)padAlloc.size(); d++)
+        if (!llvm::isPowerOf2_64(padAlloc[d])) {
+          int64_t p = 1;
+          while (p < padAlloc[d])
+            p *= 2;
+          padAlloc[d] = p;
+        }
+      auto padMemTy = ttg::MemDescType::get(
+          ctx, padMemShape, memDescType.getElementType(),
+          memDescType.getEncoding(), memDescType.getMemorySpace(),
+          memDescType.getMutableMemory(), padAlloc);
+
+      auto regLayoutPad = ttg::toLinearLayout(padRegTy);
+      auto sharedLayoutPad = ttg::toLinearLayout(padMemTy);
+      auto cvt = regLayoutPad.invertAndCompose(sharedLayoutPad);
+      cvt = cvt.sublayout({kReg, kLane, kWarp}, {kOffset});
+      auto applyOff = [&](int reg, int lane, int warp) -> int64_t {
+        auto out = cvt.apply({{kReg, reg}, {kLane, lane}, {kWarp, warp}});
+        return out.front().second;
+      };
+      int nLaneBits = cvt.getInDimSizeLog2(kLane);
+      int nWarpBits = cvt.getInDimSizeLog2(kWarp);
+
+      // real split-layout register coords → real register-array index
+      auto realTbl = getRegCoordTable(srcRtt);
+      std::map<SmallVector<int>, int> realCoordToReg;
+      for (int i = 0; i < nElems && i < (int)realTbl.regCoords.size(); i++)
+        realCoordToReg[realTbl.regCoords[i]] = i;
+
+      emit("// register→shared store (non-pow2 n80, padded invertAndCompose)");
+      emit("{");
+      indent();
+      std::string lwExpr = "0";
+      for (int b = 0; b < nLaneBits; b++) {
+        int64_t d = applyOff(0, 1 << b, 0);
+        if (d != 0)
+          lwExpr += " ^ (((lane_id >> " + std::to_string(b) + ") & 1) * " +
+                    std::to_string(d) + ")";
+      }
+      for (int b = 0; b < nWarpBits; b++) {
+        int64_t d = applyOff(0, 0, 1 << b);
+        if (d != 0)
+          lwExpr += " ^ (((warp_id >> " + std::to_string(b) + ") & 1) * " +
+                    std::to_string(d) + ")";
+      }
+      emit("int _lw = " + lwExpr + ";");
+      // colgroup-stride rescale (transposed multi-colgroup n80 store).
+      // The padded invertAndCompose addresses the smem buffer using the PADDED
+      // (pow2) alloc, so the colgroup stride = padAlloc[outer]*W. The REAL
+      // buffer uses realAlloc[outer]*W. For a single-colgroup buffer every
+      // within-colgroup address is < colstridePad so this is an exact no-op;
+      // for a multi-colgroup TRANSPOSED store (where the OUTER dim is padded,
+      // e.g. [80,128]→pad[128,128], 2 colgroups) the padded colgroup stride
+      // 128*W overshoots the real 80*W → OOB. Because colstridePad is pow2 and
+      // every within-colgroup offset is strictly < colstridePad in the padded
+      // space, we recover (colgroup, within) by /,% on the full runtime address
+      // _lw^off and rebuild with the real stride. (XOR is safe to split here:
+      // padded within-colgroup addresses occupy the low bits below the pow2
+      // colstridePad boundary, the colgroup index the high bits.)
+      // The non-pow2 (padded) dim is ALWAYS the physical colgroup-scaling dim:
+      // the swizzle-inner dim is a multiple of W (pow2) and is never padded, so
+      // the only padded dim is the "rows" count that scales the colgroup stride
+      // (rows*W). Use the dim where realAlloc != padAlloc.
+      int64_t colstridePad = 0, colstrideReal = 0;
+      if (auto nvmma = dyn_cast<ttg::NVMMASharedEncodingAttr>(
+              memDescType.getEncoding())) {
+        int elemBytes =
+            (int)(memDescType.getElementType().getIntOrFloatBitWidth() / 8);
+        int W = elemBytes > 0 ? nvmma.getSwizzlingByteWidth() / elemBytes : 0;
+        if (W > 0 && realAlloc.size() == padAlloc.size()) {
+          for (int d = 0; d < (int)padAlloc.size(); d++)
+            if (realAlloc[d] != padAlloc[d]) {
+              colstridePad = padAlloc[d] * (int64_t)W;
+              colstrideReal = realAlloc[d] * (int64_t)W;
+              break;
+            }
+        }
+      }
+      bool rescaleCol =
+          colstridePad > 0 && colstrideReal > 0 && colstridePad != colstrideReal;
+      int colShiftPad = 0;
+      if (rescaleCol)
+        colShiftPad = (int)llvm::Log2_64((uint64_t)colstridePad);
+      int nPad = getElemsPerThread(padRegTy);
+      for (int i = 0; i < nPad; i++) {
+        auto c = regLayoutPad.apply(
+            {{kReg, i}, {kLane, 0}, {kWarp, 0}, {kBlock0, 0}});
+        SmallVector<int> key;
+        bool inReal = true;
+        for (int d = 0; d < (int)c.size(); d++) {
+          int v = (int)c[d].second;
+          key.push_back(v);
+          if (d < (int)srcShape.size() && v >= (int)srcShape[d])
+            inReal = false;
+        }
+        if (!inReal)
+          continue;
+        auto it = realCoordToReg.find(key);
+        if (it == realCoordToReg.end())
+          continue;
+        int64_t off = applyOff(i, 0, 0);
+        if (rescaleCol) {
+          emit("{ int _f = _lw ^ " + std::to_string(off) + "; " +
+               std::string(dstVar) + "[((_f >> " + std::to_string(colShiftPad) +
+               ") * " + std::to_string(colstrideReal) + ") + (_f & " +
+               std::to_string(colstridePad - 1) + ")] = " +
+               getElemExpr(val, std::to_string(it->second)) + "; }");
+        } else {
+          emit(std::string(dstVar) + "[_lw ^ " + std::to_string(off) + "] = " +
+               getElemExpr(val, std::to_string(it->second)) + ";");
+        }
+      }
+      dedent();
+      emit("}");
+      return;
+    }
+  }
 
   auto regLayout = ttg::toLinearLayout(srcRtt);
 
@@ -9592,6 +10542,82 @@ void CUDACodeGen::emitConvertLayout(ttg::ConvertLayoutOp op) {
     sharedMemOffset = savedSmemOffsetMmaCvt;
     dedent();
     emit("}");
+  } else if (llvm::any_of(srcRtt.getShape(),
+                          [](int64_t d) { return !llvm::isPowerOf2_64(d); }) ||
+             llvm::any_of(rtt.getShape(),
+                          [](int64_t d) { return !llvm::isPowerOf2_64(d); })) {
+    // Native non-pow2 WGMMA (omni-style n80): the GF(2) LinearLayout aborts on
+    // a non-pow2 shape dim, so the toLinearLayout-based fast/shuffle/smem paths
+    // below cannot run. Use the split-layout-aware register-coordinate table.
+    // The relevant convert is mma-accumulator(n80) → dot-operand-A(K=80) in a
+    // chained WGMMA (dV=P^T·dO, dK=dS^T·Q): the accumulator D-fragment and the
+    // A-operand fragment place each logical element on the SAME (lane,warp), so
+    // it is a pure per-thread register permutation (matched by coordinate).
+    auto srcTbl = getRegCoordTable(srcRtt);
+    auto dstTbl = getRegCoordTable(rtt);
+    if (srcTbl.laneBases != dstTbl.laneBases ||
+        srcTbl.warpBases != dstTbl.warpBases ||
+        srcTbl.blockBases != dstTbl.blockBases) {
+      std::string msg = "[emit_cuda] non-pow2 convert_layout requires matching "
+                        "lane/warp placement (cross-thread non-pow2 convert "
+                        "unsupported)";
+      op->emitError(msg);
+      if (!emitFailed) { emitFailed = true; emitErrorMsg = msg; }
+      return;
+    }
+    std::map<llvm::SmallVector<int>, int> srcCoordToReg;
+    for (int s = 0; s < nSrc && s < (int)srcTbl.regCoords.size(); s++)
+      srcCoordToReg.insert({srcTbl.regCoords[s], s}); // keep first occurrence
+    // Opt-in (TRITON_BWD_INPLACE_RS_PACK=1, default OFF): when this bf16/f16
+    // convert feeds ONLY WGMMA A-operands (RS mode), emit the result directly
+    // as packed uint32 words (2 elems per word, in the wgmma A-operand pairing
+    // order aVar[2i],aVar[2i+1]) and register it in packedU32Convert so
+    // emitWarpGroupDot aliases _a_packed onto it with NO copy. This halves the
+    // A-operand staging registers (cvt[N] bf16 + _a_packed[N/2] u32  ->  one
+    // u32[N/2]), relieving the v13 80-row consumer register cliff that makes
+    // ptxas serialize the async WGMMAs (C7512). Default OFF => tut-01/02 and
+    // every other kernel stay byte-identical (packedU32Convert never gains a
+    // bf16 entry, so the wgmma alias branch below is never taken for them).
+    static const bool inplaceRsPack =
+        (getenv("TRITON_BWD_INPLACE_RS_PACK") != nullptr) &&
+        (std::string(getenv("TRITON_BWD_INPLACE_RS_PACK")) == "1");
+    bool packToU32 = inplaceRsPack && (elemType.isBF16() || elemType.isF16()) &&
+                     nDst > 0 && (nDst % 2 == 0) &&
+                     (int)dstTbl.regCoords.size() >= nDst;
+    if (packToU32)
+      for (Operation *user : result.getUsers()) {
+        auto dotOp = dyn_cast<ttng::WarpGroupDotOp>(user);
+        if (!dotOp || dotOp.getA() != result) { packToU32 = false; break; }
+      }
+    if (packToU32) {
+      emit("// convert_layout (non-pow2 register-local, PACKED u32 for wgmma A "
+           "RS, opt-in TRITON_BWD_INPLACE_RS_PACK)");
+      emit("uint32_t " + var + "[" + std::to_string(nDst / 2) + "];");
+      for (int i = 0; i < nDst / 2; i++) {
+        auto regOf = [&](int d) {
+          auto it = srcCoordToReg.find(dstTbl.regCoords[d]);
+          return (it != srcCoordToReg.end()) ? it->second : 0;
+        };
+        emit("{");
+        indent();
+        emit(cudaType + " _e0 = " + srcVar + "[" + std::to_string(regOf(2 * i)) + "];");
+        emit(cudaType + " _e1 = " + srcVar + "[" + std::to_string(regOf(2 * i + 1)) + "];");
+        emit(var + "[" + std::to_string(i) +
+             "] = ((uint32_t)*(uint16_t*)&_e0) | ((uint32_t)*(uint16_t*)&_e1) << 16;");
+        dedent();
+        emit("}");
+      }
+      packedU32Convert[result] = nDst / 2;
+    } else {
+      emit("// convert_layout (non-pow2 register-local, no smem)");
+      emit(cudaType + " " + var + "[" + std::to_string(nDst) + "];");
+      for (int d = 0; d < nDst && d < (int)dstTbl.regCoords.size(); d++) {
+        auto it = srcCoordToReg.find(dstTbl.regCoords[d]);
+        int s = (it != srcCoordToReg.end()) ? it->second : 0;
+        emit(var + "[" + std::to_string(d) + "] = " + srcVar + "[" +
+             std::to_string(s) + "];");
+      }
+    }
   } else {
     // Fast path: register-local conversion (no shared memory). If src and dst
     // place every logical element on the SAME (lane,warp) — i.e. identical
@@ -10237,10 +11263,23 @@ void CUDACodeGen::emitMemDescSubview(Operation *op) {
         offsetBytes = ((off0 / eRow) * (strideDim * eRow) + off1 * eRow +
                        (off0 % eRow)) * elemBytes;
       } else {
-        // physical [stride=dim0, contig=dim1]
-        int64_t contigDim = shape.size() > 1 ? shape[1] : 1;
-        int64_t rowStrideBytes = std::min<int64_t>(contigDim, eRow) * elemBytes;
-        offsetBytes = off0 * rowStrideBytes + off1 * elemBytes;
+        // physical [stride=dim0, contig=dim1]. Slicing the contiguous (N) dim
+        // past an eRow swizzle-chunk boundary is NOT a flat byte offset: each
+        // eRow-wide column chunk occupies a separate contiguous block of
+        // strideDim*eRow elements (mirrors emitWarpGroupDot's b_byte_offset
+        // non-transposed path). Derive the chunk stride from the PARENT (alloc)
+        // dims so it matches the stored swizzle layout; a flat off1*elemBytes
+        // desyncs the sub-tile's swizzle from the data for off1 >= eRow. For
+        // off1 == 0 (the common K-only-slice callers) both forms coincide.
+        int rank2 = (int)shape.size();
+        auto allocShape2 = memDescType.getAllocShape().take_back(rank2);
+        SmallVector<int64_t> allocPerCTA2 =
+            ttg::getShapePerCTA(memDescType.getEncoding(), allocShape2);
+        int64_t strideDim = allocPerCTA2[0];
+        int64_t contigFull = rank2 > 1 ? allocPerCTA2[1] : 1;
+        int64_t eRowEff = std::min<int64_t>(contigFull, eRow);
+        offsetBytes = ((off1 / eRowEff) * (strideDim * eRowEff) +
+                       off0 * eRowEff + (off1 % eRowEff)) * elemBytes;
       }
     } else {
       // Non-swizzled / generic: offset within the PARENT buffer. Strides must
@@ -10862,12 +11901,14 @@ void CUDACodeGen::emitWarpGroupDot(ttng::WarpGroupDotOp op) {
       emit("}");
       dedent();
       emit("}");
-    } else if (isFp8 && packedU32Convert.count(a)) {
-      // Fused: the warp-shuffle convert already produced A as packed uint32
-      // words (one per 4 fp8 elements) in exactly this wgmma's A-operand order
-      // (see emitConvertLayout packed path). Alias _a_packed onto it directly,
-      // skipping the byte-unpack/re-pack round-trip entirely.
-      a_packed_per_ktile = a_regs_per_ktile / 4;
+    } else if ((isFp8 || aElem == "bf16" || aElem == "f16") &&
+               packedU32Convert.count(a)) {
+      // Fused: the convert already produced A as packed uint32 words in exactly
+      // this wgmma's A-operand order (see emitConvertLayout packed paths: fp8
+      // warp-shuffle = 4 elems/word; bf16/f16 non-pow2 register-local opt-in =
+      // 2 elems/word). Alias _a_packed onto it directly, skipping the
+      // unpack/re-pack round-trip and its duplicate staging registers.
+      a_packed_per_ktile = a_regs_per_ktile / (isFp8 ? 4 : 2);
       emit("uint32_t* _a_packed = " + aVar + ";");
     } else {
       // f16/bf16: pack 2 16-bit values per uint32 (kWidth=2).
@@ -11324,6 +12365,58 @@ TMACopyPlan CUDACodeGen::computeTMACopyPlan(ttg::MemDescType smemTy,
     auto shapePerCTA = ttg::getShapePerCTA(smemTy);
     auto blockShape = ttng::getTMABlockShape(smemTy, /*packedSize=*/true);
     int smemRank = (int)shapePerCTA.size();
+    // Native non-pow2 WGMMA N (omni-style n80): a smem tile whose row count is
+    // non-pow2 (e.g. q_smem[80,128]) has a perfectly valid TMA box (box dims may
+    // be any value <= 256), but the LinearLayout copy-plan machinery below
+    // requires pow2 out-dim sizes. When the non-pow2 dim is a SINGLE TMA message
+    // (blockShape[d] == shapePerCTA[d] — the whole dim fits in one box), it
+    // contributes nothing to numCopies / coordOff: the per-message GLOBAL
+    // coordinate offsets of the OTHER dims (swizzle column groups) are
+    // independent of that dim's exact size. So compute the plan on a pow2
+    // stand-in (the dim rounded down to the nearest pow2).
+    //
+    // The per-message SHARED-MEMORY element offset, however, DOES depend on the
+    // exact size of the substituted dim. NVMMA swizzled smem is column-group
+    // major: the contiguous (swizzle) dim is split into W-wide groups and those
+    // groups are the OUTERMOST stride, so colgroup_stride == (product of all
+    // other dims) * W. Substituting a non-pow2 outer dim from R down to P shrinks
+    // that stride by P/R (e.g. q_smem[72,128] colgroup1 lands at 72*64=4608, but
+    // the P=64 stand-in computes 64*64=4096 — a 512-elem mismatch vs. what the
+    // WGMMA B-descriptor LBO expects, corrupting every K>=swizzle_width step).
+    // Messages only ever vary along NON-substituted dims (substituted dims are a
+    // single message), so each substituted outer dim scales every smem offset by
+    // exactly R/P; rescale the stand-in plan's shMemElemOffset accordingly.
+    {
+      bool needSub = false;
+      llvm::SmallVector<int64_t> subShape(shapePerCTA.begin(),
+                                          shapePerCTA.end());
+      for (int d = 0; d < smemRank; ++d) {
+        if (!llvm::isPowerOf2_64(shapePerCTA[d]) &&
+            blockShape[d] == shapePerCTA[d]) {
+          int64_t p = 1;
+          while (p * 2 <= shapePerCTA[d])
+            p *= 2;
+          subShape[d] = p;
+          needSub = true;
+        }
+      }
+      if (needSub) {
+        auto subTy = ttg::MemDescType::get(
+            ctx, subShape, smemTy.getElementType(), smemTy.getEncoding(),
+            smemTy.getMemorySpace(), smemTy.getMutableMemory(), subShape);
+        auto subPlan = computeTMACopyPlan(subTy, coordRank);
+        for (auto &off : subPlan.shMemElemOffset) {
+          for (int d = 0; d < smemRank; ++d) {
+            if (subShape[d] != shapePerCTA[d]) {
+              // off is divisible by subShape[d] (it is a multiple of the
+              // colgroup stride, which carries subShape[d] as a factor).
+              off = off / subShape[d] * shapePerCTA[d];
+            }
+          }
+        }
+        return subPlan;
+      }
+    }
     plan.smemRank = smemRank;
     auto kMsg = mlir::StringAttr::get(ctx, "msg");
     auto kBlock = mlir::StringAttr::get(ctx, "block");
