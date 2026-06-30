@@ -96,7 +96,7 @@ static std::string mlirTypeToCUDA(Type type) {
     auto memDesc = cast<ttg::MemDescType>(type);
     return mlirTypeToCUDA(memDesc.getElementType()) + "*";
   }
-  if (isa<tt::TensorDescType>(type)) {
+  if (isa<tt::TensorDescType>(type) || isa<ttng::TensorDescIm2ColType>(type)) {
     return "const __grid_constant__ CUtensorMap";
   }
   return "int"; // fallback
@@ -12493,6 +12493,54 @@ void CUDACodeGen::emitAsyncTMACopyG2L(ttng::AsyncTMACopyGlobalToLocalOp op) {
   SmallVector<std::string> coordVar(rank);
   for (int d = 0; d < rank; d++)
     coordVar[d] = getVar(coords[d]);
+
+  // TMA im2col mode (omni-style HW im2col gather). When the op carries `offsets`
+  // (the kernel tap offsets {kw,kh,kt}), emit the `.im2col` bulk-tensor copy with
+  // trailing u16 offset operands. Coords are the full-tensor pixel base; emitted
+  // innermost-first (reverse of IR order) → PTX {coord_c,coord_w,coord_h,coord_d,
+  // coord_n}. Non-multicast single copy into the 2D smem tile.
+  auto im2colOffsets = op.getOffsets();
+  if (!im2colOffsets.empty()) {
+    int noff = (int)im2colOffsets.size();
+    SmallVector<std::string> offVar(noff);
+    for (int i = 0; i < noff; i++)
+      offVar[i] = getVar(im2colOffsets[i]);
+    emit("if (threadIdx.x == 0) {");
+    indent();
+    emit("if (" + predVar + ") {");
+    indent();
+    std::string braceList, offList;
+    for (int i = 0; i < rank; i++) {
+      braceList += "%" + std::to_string(i + 2);
+      if (i != rank - 1)
+        braceList += ", ";
+    }
+    for (int i = 0; i < noff; i++) {
+      offList += "%" + std::to_string(rank + 3 + i);
+      if (i != noff - 1)
+        offList += ", ";
+    }
+    emit("asm volatile(");
+    emit("    \"cp.async.bulk.tensor." + std::to_string(rank) +
+         "d.shared::cluster.global.im2col.mbarrier::complete_tx::bytes"
+         " [%0], [%1, {" +
+         braceList + "}], [%" + std::to_string(rank + 2) + "], {" + offList +
+         "};\\n\"");
+    emit("    :: \"r\"((unsigned)__cvta_generic_to_shared(" + smemVar + ")),");
+    emit("       \"l\"(" + descAddr + "),");
+    for (int i = 0; i < rank; i++)
+      emit("       \"r\"(" + coordVar[rank - 1 - i] + "),");
+    emit("       \"r\"((unsigned)__cvta_generic_to_shared(" + barVar + ")),");
+    for (int i = 0; i < noff; i++)
+      emit("       \"h\"((unsigned short)" + offVar[i] + ")" +
+           (i == noff - 1 ? "" : ","));
+    emit(");");
+    dedent();
+    emit("}");
+    dedent();
+    emit("}");
+    return;
+  }
 
   auto smemTy = cast<ttg::MemDescType>(op.getResult().getType());
   TMACopyPlan plan = computeTMACopyPlan(smemTy, rank);

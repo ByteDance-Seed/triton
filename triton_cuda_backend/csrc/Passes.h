@@ -39,6 +39,11 @@ std::unique_ptr<mlir::Pass> createMulticastPass();
 // with exactly 2 consumer partitions whose mainloop has >=2 WGMMA dots.
 std::unique_ptr<mlir::Pass> createWgPingpongPass();
 
+// im2col: rewrite a frontend "__IM2COL__" print-marker + placeholder TMA copy
+// into a real Hopper TMA im2col copy (retype descriptor, attach tap offsets).
+// No-op when no marker is present. See Im2colRewritePass.cpp.
+std::unique_ptr<mlir::Pass> createIm2colRewritePass();
+
 } // namespace triton_cuda
 
 #endif // TRITON_CUDA_BACKEND_PASSES_H

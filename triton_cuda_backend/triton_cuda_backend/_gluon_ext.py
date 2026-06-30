@@ -49,3 +49,47 @@ def inject_async_reduce_shared_to_global():
             _tma.__all__.append("async_reduce_shared_to_global")
     except (AttributeError, TypeError):
         pass
+
+
+_im2col_launcher_installed = False
+
+
+def inject_im2col_launcher():
+    """Make the launcher build a HW im2col CUtensorMap for TensorDescriptors tagged
+    with ``_im2col_params`` (set by the conv host glue). This is the host half of
+    the backend TMA-im2col support (the device half is Im2colRewritePass + the
+    emitter). Non-invasive: wraps the nvidia driver's ``make_tensordesc_arg`` and
+    reuses Triton's own ``fill_tma_descriptor_im2col`` (cuTensorMapEncodeIm2col),
+    so untagged descriptors are byte-identical to before. Idempotent.
+
+    _im2col_params = (N,D,H,W,Cin, kT,kH,kW, pT,pH,pW, sT,sH,sW, BM,BK): the conv
+    geometry. The descriptor's globalDim is {C,W,H,D,N} (the driver reverses the
+    NDHWC shape we pass), corners encode the padding window, channelsPerPixel=BK,
+    pixelsPerColumn=BM, elementStrides encode the stride. See SKILL.md."""
+    global _im2col_launcher_installed
+    if _im2col_launcher_installed:
+        return
+    try:
+        from triton.backends.nvidia import driver as _drv
+    except Exception:
+        return
+    import triton as _triton
+    _orig = _drv.make_tensordesc_arg
+
+    def _make(arg, metadata):
+        p = getattr(arg, "_im2col_params", None)
+        if p is None:
+            return _orig(arg, metadata)
+        N, D, H, W, Cin, kT, kH, kW, pT, pH, pW, sT, sH, sW, BM, BK = p
+        util = _triton.runtime.driver.active.utils
+        cu = util.fill_tma_descriptor_im2col(
+            arg.base.data_ptr(), metadata["swizzle"], metadata["elem_size"],
+            _drv.TMA_DTYPE_DEVICE_TO_HOST[metadata["elem_type"]],
+            [BM, BK], [N, D, H, W, Cin],
+            [D * H * W * Cin, H * W * Cin, W * Cin, Cin, 1], 0,
+            [-pT, -pH, -pW], [pT - (kT - 1), pH - (kH - 1), pW - (kW - 1)],
+            BK, BM, [1, sT, sH, sW, 1])
+        return [cu, *arg.shape, *arg.strides]
+
+    _drv.make_tensordesc_arg = _make
+    _im2col_launcher_installed = True

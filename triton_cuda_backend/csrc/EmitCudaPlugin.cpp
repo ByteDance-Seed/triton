@@ -111,6 +111,10 @@ void addEmitCudaPass(PassManager *pm, const std::vector<std::string> &args) {
   bool multicast = args.size() > 7 && std::atoi(args[7].c_str()) != 0;
   bool wgPingpong = args.size() > 8 && std::atoi(args[8].c_str()) != 0;
 
+  // im2col rewrite always runs first (no-op without a __IM2COL__ marker): it turns
+  // the conv producer's placeholder TMA copy into a real HW TMA im2col copy.
+  pm->addPass(triton_cuda::createIm2colRewritePass());
+
   // IR->IR structural transforms run BEFORE the emit-cuda lowering pass, so the
   // emitter only ever prints; all gemm_06-class structure is introduced here.
   // Gated by frontend flags (not env vars).
