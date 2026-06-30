@@ -3,17 +3,22 @@
 // Turns a frontend "placeholder + marker" into a real Hopper TMA **im2col** copy.
 //
 // The Triton/Gluon frontend cannot create an im2col `ttng.async_tma_copy_global_
-// _to_local` directly: no pristine Python binding passes `offsets` or builds a
-// `ttng.tensordesc_im2col` value, and the trace-time verifier ties im2col mode to
-// the descriptor type. So the backend (this pass, all in triton_cuda_backend)
-// synthesizes it. The frontend builtin `tma.async_copy_im2col` (in _gluon_ext.py)
-// emits, back to back:
-//   tt.print "__IM2COL__" : c, w, h, d, n, kw, kh, kt   (carries the 8 i32 vals)
+// _to_local` directly: the `create_async_tma_copy_global_to_local` binding hard-
+// wires the no-`offsets` build variant, no binding builds a `ttng.tensordesc_im2col`
+// value, and the trace-time verifier ties im2col mode to the descriptor type. So
+// the backend (this pass, all in triton_cuda_backend) synthesizes it. The frontend
+// (`_im2col_load` in the tutorial) emits, back to back:
+//   tt.elementwise_inline_asm "im2col.marker" : c,w,h,d,n,kw,kh,kt   (8 i32 carrier)
 //   ttng.async_tma_copy_global_to_local <a_desc>[0,0] <bar> <smem> <pred>  (placeholder)
-// where a_desc is a (tiled) tensordesc whose block type is the 2D smem tile.
+// where a_desc is a (tiled) tensordesc whose block type is the 2D smem tile. A
+// tagged inline-asm op is used as the carrier (not device_print): its purpose IS to
+// pass operands + a verbatim string to the backend, it carries the 8 i32 values as
+// real operands, and the tag is matched exactly (no print-prefix mangling). It is
+// is_pure=False so Triton's TTGIR DCE keeps it until this pass; the asm body is
+// never emitted because this pass erases the op first.
 //
-// This pass, for each "__IM2COL__" print: takes the 8 carried values, retypes the
-// descriptor block-arg to `ttng.tensordesc_im2col`, and replaces the placeholder
+// This pass, for each "im2col.marker" carrier: takes the 8 carried values, retypes
+// the descriptor block-arg to `ttng.tensordesc_im2col`, and replaces the placeholder
 // copy with a real im2col copy
 //   coords  = [n, d, h, w, c]   (IR order; the emitter reverses -> PTX {c,w,h,d,n})
 //   offsets = [kw, kh, kt]      (i16, the kernel taps)
@@ -47,30 +52,30 @@ struct Im2colRewritePass
 
   StringRef getArgument() const override { return "im2col-rewrite"; }
   StringRef getDescription() const override {
-    return "Rewrite __IM2COL__ placeholder into a real TMA im2col copy";
+    return "Rewrite im2col.marker placeholder into a real TMA im2col copy";
   }
 
   void runOnOperation() override {
     ModuleOp mod = getOperation();
     MLIRContext *ctx = mod.getContext();
 
-    SmallVector<tt::PrintOp> markers;
-    // device_print mangles the prefix (leading " ", trailing ": "), so match by
-    // substring rather than prefix.
-    mod.walk([&](tt::PrintOp p) {
-      if (p.getPrefix().contains("__IM2COL__"))
-        markers.push_back(p);
+    SmallVector<tt::ElementwiseInlineAsmOp> markers;
+    // The carrier is a tagged inline-asm op; its asm_string is verbatim (no
+    // mangling), so match it exactly.
+    mod.walk([&](tt::ElementwiseInlineAsmOp a) {
+      if (a.getAsmString() == "im2col.marker")
+        markers.push_back(a);
     });
 
-    for (tt::PrintOp print : markers) {
-      auto args = print.getArgs();
+    for (tt::ElementwiseInlineAsmOp marker : markers) {
+      auto args = marker.getArgs();
       if (args.size() != 8) {
-        print->emitError("im2col marker expects 8 args (c,w,h,d,n,kw,kh,kt)");
+        marker->emitError("im2col marker expects 8 args (c,w,h,d,n,kw,kh,kt)");
         return signalPassFailure();
       }
       // Find the placeholder copy following the marker in the same block.
       ttng::AsyncTMACopyGlobalToLocalOp copy;
-      for (Operation *cur = print->getNextNode(); cur;
+      for (Operation *cur = marker->getNextNode(); cur;
            cur = cur->getNextNode()) {
         if (auto c = dyn_cast<ttng::AsyncTMACopyGlobalToLocalOp>(cur)) {
           copy = c;
@@ -78,7 +83,7 @@ struct Im2colRewritePass
         }
       }
       if (!copy) {
-        print->emitError("no async_tma_copy after __IM2COL__ marker");
+        marker->emitError("no async_tma_copy after im2col.marker carrier");
         return signalPassFailure();
       }
 
@@ -130,7 +135,7 @@ struct Im2colRewritePass
           /*isVolatile=*/false);
 
       copy.erase();
-      print.erase();
+      marker.erase();
     }
   }
 };

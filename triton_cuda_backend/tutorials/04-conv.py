@@ -28,9 +28,10 @@ cached) to the faster:
       compute-bound shapes (incl. H/W=1k/2k/4k: ~1.0-1.27x of omni production).
 This TMA-im2col path is implemented ENTIRELY in triton_cuda_backend (zero Triton
 edits): a backend MLIR pass (Im2colRewritePass) synthesizes the im2col op from a
-``device_print("__IM2COL__")`` marker + placeholder copy, the emitter prints the
-``.im2col`` PTX, and the launcher (``inject_im2col_launcher``) builds the im2col
-CUtensorMap via Triton's own ``fill_tma_descriptor_im2col``. dgrad/wgrad use (A).
+tagged ``inline_asm_elementwise("im2col.marker")`` carrier + placeholder copy, the
+emitter prints the ``.im2col`` PTX, and the launcher (``inject_im2col_launcher``)
+builds the im2col CUtensorMap via Triton's own ``fill_tma_descriptor_im2col``.
+dgrad/wgrad use (A).
 
   * fwd        : out[M,Cout] = A_im2col(input,pad=0)[M,K] @ W[Cout,K]^T  (one GEMM)
   * dgrad s==1 : "dgrad-as-fprop" — one fused GEMM reusing the fwd kernel with
@@ -662,8 +663,18 @@ if _HAVE_GLUON:
 
     @gluon.jit
     def _im2col_load(a_desc, c, w, h, d, n, kw, kh, kt, bar, smem, pred):
-        # marker (consumed by Im2colRewritePass) + placeholder copy it rewrites.
-        gl.device_print("__IM2COL__", c, w, h, d, n, kw, kh, kt)
+        # Carrier marker (consumed + erased by Im2colRewritePass) + the placeholder
+        # tiled copy it rewrites into a real HW im2col copy. We use a TAGGED inline-
+        # asm op rather than device_print: its whole purpose is to hand operands +
+        # a verbatim string to the backend (no print-IO semantics to abuse, no
+        # prefix mangling). is_pure=False so Triton's TTGIR DCE keeps it alive until
+        # our backend pass runs; the asm body ("im2col.marker") is never emitted --
+        # the pass deletes the op first. The 8 i32s are the pixel base (c,w,h,d,n)
+        # and the kernel taps (kw,kh,kt); the dummy result is discarded.
+        gl.inline_asm_elementwise(
+            asm="im2col.marker", constraints="=r,r,r,r,r,r,r,r,r",
+            args=[c, w, h, d, n, kw, kh, kt],
+            dtype=gl.int32, is_pure=False, pack=1)
         _gtma.async_copy_global_to_shared(a_desc, [0, 0], bar, smem, pred)
 
     @gluon.jit

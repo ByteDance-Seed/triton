@@ -152,16 +152,23 @@ The chicken-and-egg: the frontend cannot create the im2col op (no pristine bindi
 passes `offsets` or builds `tensordesc_im2col`; the trace-time verifier ties
 im2col mode to the descriptor type). Solution, four backend-owned pieces:
 
-1. **Frontend marker** (`_im2col_load` in tutorials/04-conv.py): emits
-   `gl.device_print("__IM2COL__", c,w,h,d,n, kw,kh,kt)` (carries the 8 i32 coord/
-   tap values — `tt.print` takes scalar varargs) immediately followed by a VALID
-   placeholder `tma.async_copy_global_to_shared(a_desc, [0,0], bar, smem)`.
+1. **Frontend carrier** (`_im2col_load` in tutorials/04-conv.py): emits a TAGGED
+   inline-asm `gl.inline_asm_elementwise(asm="im2col.marker", args=[c,w,h,d,n,
+   kw,kh,kt], dtype=int32, is_pure=False, pack=1)` (carries the 8 i32 coord/tap
+   values as real operands) immediately followed by a VALID placeholder
+   `tma.async_copy_global_to_shared(a_desc, [0,0], bar, smem)`. Use inline-asm, NOT
+   device_print: its purpose IS to pass operands+a string to the backend (no print
+   semantics abused, no prefix mangling). `is_pure=False` is REQUIRED — a pure op
+   with unused result is DCE'd by Triton's TTGIR passes before the backend pass
+   runs; the asm body is never emitted (the pass erases the op first).
 2. **Backend MLIR pass** (`csrc/Im2colRewritePass.cpp`, runs first in the emit_cuda
-   pipeline): matches the "__IM2COL__" print (device_print mangles the prefix to
-   " __IM2COL__: " -> match by `.contains`), retypes the descriptor block-arg to
-   `ttng::TensorDescIm2ColType`, and replaces the placeholder with a real im2col
-   `AsyncTMACopyGlobalToLocalOp` (coords [n,d,h,w,c]; offsets i16 [kw,kh,kt]),
-   then erases the print + placeholder.
+   pipeline): `walk`s `tt::ElementwiseInlineAsmOp` and matches `getAsmString() ==
+   "im2col.marker"` (exact, no mangling), retypes the descriptor block-arg to
+   `ttng::TensorDescIm2ColType` (+updates the FuncOp signature), replaces the next
+   placeholder copy with a real im2col `AsyncTMACopyGlobalToLocalOp` (coords
+   [n,d,h,w,c]; offsets i16 [kw,kh,kt]), then erases the carrier + placeholder.
+   Verified: dumped .cu has NO trace of the marker and the real `.im2col` PTX is
+   emitted (so the kernel is byte-identical to the old device_print version).
 3. **Emitter** (`CUDACodeGen.cpp`): treats `TensorDescIm2ColType` as a
    `__grid_constant__ CUtensorMap` param, and for a copy with offsets emits
    omni's exact `cp.async.bulk.tensor.<rank>d.shared::cluster.global.im2col...
